@@ -3,3 +3,4 @@
 /install/*
 /logs/*
 .vscode/*
+.cache/*
