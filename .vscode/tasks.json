@@ -1,0 +1,95 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "build lane_detection",
+			"type": "shell",
+			"command": "bash",
+			"args": [
+				"-lc",
+				"source /opt/ros/humble/setup.bash && cd /home/hhouse/ws/lineas_buenas && colcon build --base-paths . --packages-select lane_detection --cmake-args -DCMAKE_BUILD_TYPE=Release"
+			],
+			"isBackground": false
+		},
+		{
+			"label": "build lane_detection",
+			"type": "shell",
+			"command": "bash",
+			"args": [
+				"-lc",
+				"source /opt/ros/humble/setup.bash && cd /home/hhouse/ws/lineas_buenas && colcon build --base-paths . --packages-select lane_detection --cmake-args -DCMAKE_BUILD_TYPE=Release"
+			],
+			"isBackground": false
+		},
+		{
+			"label": "build lane_detection once",
+			"type": "shell",
+			"command": "bash",
+			"args": [
+				"-lc",
+				"set -e; source /opt/ros/humble/setup.bash; cd /home/hhouse/ws/lineas_buenas; colcon build --base-paths . --packages-select lane_detection --cmake-args -DCMAKE_BUILD_TYPE=Release"
+			],
+			"isBackground": false
+		},
+		{
+			"label": "smoke test pipeline topics",
+			"type": "shell",
+			"command": "bash",
+			"args": [
+				"-lc",
+				"set -e; source /opt/ros/humble/setup.bash; cd /home/hhouse/ws/lineas_buenas; source install/setup.bash; ros2 run lane_detection lane_pipeline_node --ros-args -p frames_dir:=/home/hhouse/ws/lineas_buenas/frames -p publish_rate_hz:=10.0 >/tmp/lane_node.log 2>&1 & PID=$!; sleep 2; timeout 8s ros2 topic echo --once /lane_debug/original >/tmp/lane_topic_original.log 2>&1 || true; timeout 8s ros2 topic echo --once /lane_errors_est >/tmp/lane_topic_errors.log 2>&1 || true; kill $PID 2>/dev/null || true; wait $PID 2>/dev/null || true; echo 'ORIGINAL_TOPIC:'; head -n 5 /tmp/lane_topic_original.log; echo 'ERRORS_TOPIC:'; cat /tmp/lane_topic_errors.log"
+			],
+			"isBackground": false
+		},
+		{
+			"label": "smoke test pipeline topics workspace logs",
+			"type": "shell",
+			"command": "bash",
+			"args": [
+				"-lc",
+				"set -e; source /opt/ros/humble/setup.bash; cd /home/hhouse/ws/lineas_buenas; source install/setup.bash; ros2 run lane_detection lane_pipeline_node --ros-args -p frames_dir:=/home/hhouse/ws/lineas_buenas/frames -p publish_rate_hz:=10.0 >tmp/lane_node.log 2>&1 & PID=$!; sleep 2; timeout 8s ros2 topic echo --once /lane_debug/original >tmp/lane_topic_original.log 2>&1 || true; timeout 8s ros2 topic echo --once /lane_errors_est >tmp/lane_topic_errors.log 2>&1 || true; kill $PID 2>/dev/null || true; wait $PID 2>/dev/null || true; echo DONE"
+			],
+			"isBackground": false
+		},
+		{
+			"label": "build lane_detection controls",
+			"type": "shell",
+			"command": "bash",
+			"args": [
+				"-lc",
+				"set -e; source /opt/ros/humble/setup.bash; cd /home/hhouse/ws/lineas_buenas; colcon build --base-paths . --packages-select lane_detection --cmake-args -DCMAKE_BUILD_TYPE=Release"
+			],
+			"isBackground": false
+		},
+		{
+			"label": "smoke test step control",
+			"type": "shell",
+			"command": "bash",
+			"args": [
+				"-lc",
+				"set -e; source /opt/ros/humble/setup.bash; cd /home/hhouse/ws/lineas_buenas; source install/setup.bash; ros2 run lane_detection lane_pipeline_node --ros-args -p frames_dir:=/home/hhouse/ws/lineas_buenas/frames -p publish_rate_hz:=20.0 -p start_paused:=true >/home/hhouse/ws/lineas_buenas/tmp/node_step.log 2>&1 & PID=$!; sleep 2; timeout 3s ros2 topic echo --once /lane_debug/original >/home/hhouse/ws/lineas_buenas/tmp/orig_before_step.log 2>&1 || true; ros2 topic pub --once /lane_control/cmd std_msgs/msg/String '{data: step}' >/home/hhouse/ws/lineas_buenas/tmp/step_pub.log 2>&1; timeout 5s ros2 topic echo --once /lane_debug/original >/home/hhouse/ws/lineas_buenas/tmp/orig_after_step.log 2>&1 || true; kill $PID 2>/dev/null || true; wait $PID 2>/dev/null || true"
+			],
+			"isBackground": false
+		},
+		{
+			"label": "step control check 2",
+			"type": "shell",
+			"command": "bash",
+			"args": [
+				"-lc",
+				"set -e; source /opt/ros/humble/setup.bash; cd /home/hhouse/ws/lineas_buenas; source install/setup.bash; ros2 run lane_detection lane_pipeline_node --ros-args -p frames_dir:=/home/hhouse/ws/lineas_buenas/frames -p publish_rate_hz:=20.0 -p start_paused:=true >/home/hhouse/ws/lineas_buenas/tmp/node_step2.log 2>&1 & PID=$!; sleep 2; ros2 topic pub --once /lane_control/cmd std_msgs/msg/String \"{data: 'step'}\" >/home/hhouse/ws/lineas_buenas/tmp/step_pub2.log 2>&1; timeout 5s ros2 topic echo --once /lane_debug/original >/home/hhouse/ws/lineas_buenas/tmp/orig_after_step2.log 2>&1 || true; kill $PID 2>/dev/null || true; wait $PID 2>/dev/null || true"
+			],
+			"isBackground": false
+		},
+		{
+			"label": "step control check 3",
+			"type": "shell",
+			"command": "bash",
+			"args": [
+				"-lc",
+				"set -e; source /opt/ros/humble/setup.bash; cd /home/hhouse/ws/lineas_buenas; source install/setup.bash; ros2 run lane_detection lane_pipeline_node --ros-args -p frames_dir:=/home/hhouse/ws/lineas_buenas/frames -p publish_rate_hz:=20.0 -p start_paused:=true >/home/hhouse/ws/lineas_buenas/tmp/node_step3.log 2>&1 & PID=$!; sleep 2; timeout 6s ros2 topic echo --once /lane_debug/original >/home/hhouse/ws/lineas_buenas/tmp/orig_after_step3.log 2>&1 & ECHOPID=$!; sleep 1; ros2 topic pub --once /lane_control/cmd std_msgs/msg/String \"{data: 'step'}\" >/home/hhouse/ws/lineas_buenas/tmp/step_pub3.log 2>&1; wait $ECHOPID || true; kill $PID 2>/dev/null || true; wait $PID 2>/dev/null || true"
+			],
+			"isBackground": false
+		}
+	]
+}

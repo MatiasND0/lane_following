@@ -1,6 +1,13 @@
-/frames/*
-/build/*
-/install/*
-/logs/*
-.vscode/*
-.cache/*
+# ROS 2 build files
+/build/
+/install/
+/log/
+
+# frames
+/frames/
+
+# rosbags
+/rosbags/
+
+# tmp
+/tmp/
