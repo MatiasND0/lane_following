@@ -29,6 +29,8 @@ LaneState detect_lanes(const cv::Mat& bev_binary, cv::Mat& viz,
                        int bev_w, int bev_h,
                        const SlidingWindowParams& p) {
     const int win_h = bev_h / p.n_windows;
+    const double lane_px = p.lane_width_m / p.bev_scale_mpp;
+    const int min_separation_px = static_cast<int>(0.5 * lane_px);
 
     // Histograma de mitad inferior
     cv::Mat bottom_half = bev_binary(cv::Rect(0, bev_h / 2, bev_w, bev_h / 2));
@@ -56,7 +58,8 @@ LaneState detect_lanes(const cv::Mat& bev_binary, cv::Mat& viz,
         const int y_low = bev_h - (win + 1) * win_h;
 
         auto extract_window = [&](int cx, std::vector<cv::Point2f>& pts,
-                                  const cv::Scalar& color) {
+                      const cv::Scalar& color,
+                      bool exclude_near_left) {
             const int x_low  = std::max(0, cx - p.win_half_w);
             const int x_high = std::min(bev_w, cx + p.win_half_w);
 
@@ -67,29 +70,59 @@ LaneState detect_lanes(const cv::Mat& bev_binary, cv::Mat& viz,
             std::vector<cv::Point> nz;
             cv::findNonZero(window, nz);
 
-            if (static_cast<int>(nz.size()) >= p.min_pixels) {
-                double sum_x = 0.0;
-                for (const auto& pt : nz) {
-                    sum_x += pt.x + x_low;
+            std::vector<cv::Point2f> accepted_pts;
+            accepted_pts.reserve(nz.size());
+            double sum_x = 0.0;
+            for (const auto& pt : nz) {
+                const int global_x = pt.x + x_low;
+                if (exclude_near_left && std::abs(global_x - cur_left_x) < min_separation_px) {
+                    continue;
                 }
-                cx = static_cast<int>(sum_x / static_cast<double>(nz.size()));
 
-                for (const auto& pt : nz) {
-                    pts.emplace_back(static_cast<float>(pt.x + x_low),
-                                     static_cast<float>(pt.y + y_low));
+                sum_x += global_x;
+                accepted_pts.emplace_back(static_cast<float>(global_x),
+                                          static_cast<float>(pt.y + y_low));
+            }
+
+            if (static_cast<int>(accepted_pts.size()) >= p.min_pixels) {
+                double sum_x = 0.0;
+                for (const auto& p_acc : accepted_pts) {
+                    sum_x += p_acc.x;
                 }
+                cx = static_cast<int>(sum_x / static_cast<double>(accepted_pts.size()));
+
+                pts.insert(pts.end(), accepted_pts.begin(), accepted_pts.end());
             }
 
             return cx;
         };
 
-        cur_left_x  = extract_window(cur_left_x, left_pts, cv::Scalar(255, 100, 0));
-        cur_right_x = extract_window(cur_right_x, right_pts, cv::Scalar(0, 100, 255));
+        cur_left_x  = extract_window(cur_left_x, left_pts, cv::Scalar(255, 100, 0), false);
+        cur_right_x = extract_window(cur_right_x, right_pts, cv::Scalar(0, 100, 255), true);
     }
 
     LaneState state;
     state.left  = fit_polynomial(left_pts, bev_h);
     state.right = fit_polynomial(right_pts, bev_h);
+
+    // --- Robustez: evitar detectar la misma línea como L/R ---
+    if (state.left.valid && state.right.valid) {
+        const double y_base = static_cast<double>(bev_h);
+        const double x_left = state.left.a * y_base * y_base + state.left.b * y_base + state.left.c;
+        const double x_right = state.right.a * y_base * y_base + state.right.b * y_base + state.right.c;
+        const double dist_px = std::abs(x_right - x_left);
+
+        if (dist_px < 0.5 * lane_px) {
+            state.right.valid = false;
+        }
+    }
+
+    if (state.left.valid && state.right.valid) {
+        constexpr double small_slope_threshold = 0.02;
+        if (std::abs(state.left.b - state.right.b) < small_slope_threshold) {
+            state.right.valid = false;
+        }
+    }
 
     // --- Validación de ancho del carril ---
     if (state.left.valid && state.right.valid) {
@@ -105,8 +138,6 @@ LaneState detect_lanes(const cv::Mat& bev_binary, cv::Mat& viz,
     }
 
     // --- Centro del carril ---
-    const double lane_px = p.lane_width_m / p.bev_scale_mpp;
-
     if (state.left.valid && state.right.valid) {
         state.center.a = (state.left.a + state.right.a) / 2.0;
         state.center.b = (state.left.b + state.right.b) / 2.0;
