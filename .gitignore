@@ -1,0 +1,5 @@
+/frames/*
+/build/*
+/install/*
+/logs/*
+.vscode/*
