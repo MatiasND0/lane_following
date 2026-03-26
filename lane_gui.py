@@ -41,7 +41,7 @@ from PyQt5.QtWidgets import (
     QGridLayout, QVBoxLayout, QHBoxLayout,
     QGroupBox, QSizePolicy, QFrame, QSlider,
     QPushButton, QSplitter, QTabWidget, QSpinBox,
-    QFormLayout, QScrollArea
+    QDoubleSpinBox, QComboBox, QFormLayout, QScrollArea
 )
 
 # Evita conflicto de plugins Qt entre OpenCV y PyQt5.
@@ -60,6 +60,7 @@ class RosSignals(QObject):
     errors_received = pyqtSignal(float, float, float)  # e2, e3, k
     control_command = pyqtSignal(str)
     set_bev_params  = pyqtSignal(list, list)  # (src_pts_flat, dst_pts_flat)
+    set_camera_params = pyqtSignal(dict)      # parámetros de orientación de cámara
 
 
 # ---------------------------------------------------------------------------
@@ -105,6 +106,7 @@ class LaneGuiNode(Node):
             "/lane_pipeline_node/set_parameters",
         )
         self.signals.set_bev_params.connect(self._on_set_bev_params)
+        self.signals.set_camera_params.connect(self._on_set_camera_params)
 
         self.get_logger().info("LaneGuiNode suscrito a los topics de debug.")
 
@@ -155,6 +157,40 @@ class LaneGuiNode(Node):
         future = self.set_params_client.call_async(request)
         future.add_done_callback(self._on_set_params_done)
 
+    def _on_set_camera_params(self, params: dict):
+        """Envía parámetros de orientación de cámara al nodo C++ via SetParameters."""
+        if not self.set_params_client.wait_for_service(timeout_sec=1.0):
+            self.get_logger().warn("Servicio SetParameters del nodo pipeline no disponible.")
+            return
+
+        request = SetParameters.Request()
+
+        # Mapeo nombre_gui → nombre_param_ros
+        param_map = {
+            "bev_mode":               ParameterType.PARAMETER_STRING,
+            "camera_pitch":           ParameterType.PARAMETER_DOUBLE,
+            "camera_yaw":             ParameterType.PARAMETER_DOUBLE,
+            "camera_roll":            ParameterType.PARAMETER_DOUBLE,
+            "camera_height":          ParameterType.PARAMETER_DOUBLE,
+            "camera_lateral_offset":  ParameterType.PARAMETER_DOUBLE,
+        }
+
+        for name, ptype in param_map.items():
+            if name not in params:
+                continue
+            p = RosParameter()
+            p.name = name
+            p.value = ParameterValue()
+            p.value.type = ptype
+            if ptype == ParameterType.PARAMETER_STRING:
+                p.value.string_value = str(params[name])
+            else:
+                p.value.double_value = float(params[name])
+            request.parameters.append(p)
+
+        future = self.set_params_client.call_async(request)
+        future.add_done_callback(self._on_set_params_done)
+
     def _on_set_params_done(self, future):
         try:
             response = future.result()
@@ -169,11 +205,134 @@ class LaneGuiNode(Node):
 
 
 # ---------------------------------------------------------------------------
+# Label interactiva para arrastrar puntos de BEV
+# ---------------------------------------------------------------------------
+
+class InteractiveLabel(QLabel):
+    point_dragged = pyqtSignal(int, float, float)  # idx, x, y (en espacio imagen)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.points = []  # [(x, y), ...] en espacio imagen (640x360)
+        self.selected_point = -1
+        self.setMouseTracking(True)
+        self.image_size = (640, 360)
+
+    def set_points(self, points):
+        self.points = points
+        self.update()
+
+    def _map_to_image(self, pos):
+        """Mapea coordenadas del widget a coordenadas de la imagen (640x360)."""
+        if not self.pixmap() or self.pixmap().isNull():
+            return -1, -1
+
+        pw = self.pixmap().width()
+        ph = self.pixmap().height()
+        ww = self.width()
+        wh = self.height()
+
+        # Offset por el centrado del pixmap en el label
+        ox = (ww - pw) / 2
+        oy = (wh - ph) / 2
+
+        # Coordenadas relativas al pixmap
+        px = pos.x() - ox
+        py = pos.y() - oy
+
+        # Validar si está dentro del pixmap
+        if px < 0 or px > pw or py < 0 or py > ph:
+            return -1, -1
+
+        # Mapear a 640x360
+        ix = (px / pw) * self.image_size[0]
+        iy = (py / ph) * self.image_size[1]
+        return ix, iy
+
+    def _map_from_image(self, ix, iy):
+        """Mapea coordenadas de la imagen (640x360) a coordenadas del widget."""
+        if not self.pixmap() or self.pixmap().isNull():
+            return -1, -1
+
+        pw = self.pixmap().width()
+        ph = self.pixmap().height()
+        ww = self.width()
+        wh = self.height()
+
+        ox = (ww - pw) / 2
+        oy = (wh - ph) / 2
+
+        px = (ix / self.image_size[0]) * pw
+        py = (iy / self.image_size[1]) * ph
+
+        return px + ox, py + oy
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            ix, iy = self._map_to_image(event.pos())
+            if ix == -1: return
+
+            # Buscar punto más cercano
+            best_dist = 20.0  # Umbral de captura en px imagen (ajustado)
+            self.selected_point = -1
+            for i, (px, py) in enumerate(self.points):
+                dist = np.sqrt((ix - px)**2 + (iy - py)**2)
+                if dist < best_dist:
+                    best_dist = dist
+                    self.selected_point = i
+            self.update()
+
+    def mouseMoveEvent(self, event):
+        if self.selected_point != -1:
+            ix, iy = self._map_to_image(event.pos())
+            if ix != -1:
+                # Permitir arrastrar un poco fuera de la imagen
+                self.point_dragged.emit(self.selected_point, ix, iy)
+
+    def mouseReleaseEvent(self, event):
+        self.selected_point = -1
+        self.update()
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        if not self.points or not self.pixmap():
+            return
+
+        from PyQt5.QtGui import QPainter, QPen, QBrush
+
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+
+        # 1) Dibujar líneas del trapecio
+        pen = QPen(QColor(0, 229, 255, 180), 2)
+        painter.setPen(pen)
+        
+        widget_pts = [self._map_from_image(x, y) for x, y in self.points]
+        for i in range(4):
+            p1 = widget_pts[i]
+            p2 = widget_pts[(i + 1) % 4]
+            if p1[0] != -1 and p2[0] != -1:
+                painter.drawLine(int(p1[0]), int(p1[1]), int(p2[0]), int(p2[1]))
+
+        # 2) Dibujar puntos
+        for i, (wx, wy) in enumerate(widget_pts):
+            if wx == -1: continue
+            
+            color = QColor(105, 255, 71) if i != self.selected_point else QColor(255, 255, 0)
+            painter.setBrush(QBrush(color))
+            painter.setPen(QPen(Qt.black, 1))
+            painter.drawEllipse(int(wx - 5), int(wy - 5), 10, 10)
+            
+            painter.setPen(QPen(Qt.white))
+            painter.drawText(int(wx + 8), int(wy + 5), f"P{i+1}")
+
+
+# ---------------------------------------------------------------------------
 # Widget de imagen individual con título
 # ---------------------------------------------------------------------------
 
 class ImagePanel(QFrame):
-    def __init__(self, title: str, parent=None):
+    def __init__(self, title: str, parent=None, interactive=False):
         super().__init__(parent)
         self.setFrameShape(QFrame.StyledPanel)
         self.setObjectName("imagePanel")
@@ -189,7 +348,11 @@ class ImagePanel(QFrame):
         layout.addWidget(self.title_lbl)
 
         # Imagen
-        self.image_lbl = QLabel()
+        if interactive:
+            self.image_lbl = InteractiveLabel()
+        else:
+            self.image_lbl = QLabel()
+            
         self.image_lbl.setObjectName("imageLabel")
         self.image_lbl.setAlignment(Qt.AlignCenter)
         self.image_lbl.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
@@ -297,10 +460,10 @@ class BevCalibrationPanel(QFrame):
 
     # Defaults (mismos que el nodo C++)
     DEFAULT_SRC = [
-        (256.0, 264.0),   # top-left     (640*0.40, 480*0.55)
-        (384.0, 264.0),   # top-right    (640*0.60, 480*0.55)
-        (608.0, 456.0),   # bottom-right (640*0.95, 480*0.95)
-        (32.0,  456.0),   # bottom-left  (640*0.05, 480*0.95)
+        (-1.0, 274.0),
+        (652.0, 275.0),
+        (822.0, 344.0),
+        (-159.0, 344.0),
     ]
 
     DEFAULT_DST = [
@@ -333,30 +496,37 @@ class BevCalibrationPanel(QFrame):
         title.setAlignment(Qt.AlignCenter)
         layout.addWidget(title)
 
-        # Tabs SRC / DST
+        # Tabs SRC / DST / Cámara
         tabs = QTabWidget()
         tabs.setObjectName("calibTabs")
 
-        self.src_spins = self._build_point_tab("Trapecio (Perspectiva)", 640, 480)
+        self.src_spins = self._build_point_tab("Trapecio (Perspectiva)", 640, 360)
         self.dst_spins = self._build_point_tab("Rectángulo (BEV)", 320, 240)
+        self.camera_tab = self._build_camera_tab()
 
         tabs.addTab(self.src_spins["widget"], "SRC")
         tabs.addTab(self.dst_spins["widget"], "DST")
+        tabs.addTab(self.camera_tab["widget"], "CAM")
         layout.addWidget(tabs, stretch=1)
 
         # Botones
         btn_layout = QHBoxLayout()
         btn_layout.setSpacing(6)
 
-        self.apply_btn = QPushButton("▶ Aplicar")
+        self.apply_btn = QPushButton("▶ Aplicar Puntos")
         self.apply_btn.setObjectName("calibApplyBtn")
         self.apply_btn.clicked.connect(self._on_apply)
+
+        self.apply_cam_btn = QPushButton("📷 Aplicar Cámara")
+        self.apply_cam_btn.setObjectName("calibApplyBtn")
+        self.apply_cam_btn.clicked.connect(self._on_apply_camera)
 
         self.reset_btn = QPushButton("↻ Reset")
         self.reset_btn.setObjectName("calibResetBtn")
         self.reset_btn.clicked.connect(self._on_reset)
 
         btn_layout.addWidget(self.apply_btn)
+        btn_layout.addWidget(self.apply_cam_btn)
         btn_layout.addWidget(self.reset_btn)
         layout.addLayout(btn_layout)
 
@@ -392,13 +562,13 @@ class BevCalibrationPanel(QFrame):
 
             x_spin = QSpinBox()
             x_spin.setObjectName("calibSpin")
-            x_spin.setRange(0, max_x)
+            x_spin.setRange(-1000, 2000)
             x_spin.setPrefix("x:")
             x_spin.setSuffix("px")
 
             y_spin = QSpinBox()
             y_spin.setObjectName("calibSpin")
-            y_spin.setRange(0, max_y)
+            y_spin.setRange(-1000, 2000)
             y_spin.setPrefix("y:")
             y_spin.setSuffix("px")
 
@@ -424,19 +594,121 @@ class BevCalibrationPanel(QFrame):
     def _set_values(self, tab_data: dict, points: list):
         """Setea los spinboxes desde una lista de tuplas [(x,y), ...]."""
         for i, (x_spin, y_spin) in enumerate(tab_data["spins"]):
+            x_spin.blockSignals(True)
             x_spin.setValue(int(points[i][0]))
+            x_spin.blockSignals(False)
+            
+            y_spin.blockSignals(True)
             y_spin.setValue(int(points[i][1]))
+            y_spin.blockSignals(False)
+
+    def get_src_points(self):
+        """Devuelve la lista de puntos [(x,y), ...] del tab SRC."""
+        pts = []
+        for x_spin, y_spin in self.src_spins["spins"]:
+            pts.append((x_spin.value(), y_spin.value()))
+        return pts
+
+    def set_src_point(self, idx, x, y):
+        """Setea un punto específico (x, y) en el tab SRC."""
+        if 0 <= idx < len(self.src_spins["spins"]):
+            sx, sy = self.src_spins["spins"][idx]
+            sx.setValue(int(x))
+            sy.setValue(int(y))
+
+    def _build_camera_tab(self) -> dict:
+        """Construye el tab con los controles de orientación de cámara."""
+        widget = QWidget()
+        widget.setObjectName("calibTabContent")
+        layout = QVBoxLayout(widget)
+        layout.setContentsMargins(4, 4, 4, 4)
+        layout.setSpacing(4)
+
+        spins = {}
+
+        # Modo BEV
+        mode_group = QFrame()
+        mode_group.setObjectName("calibPointGroup")
+        mg_layout = QHBoxLayout(mode_group)
+        mg_layout.setContentsMargins(4, 2, 4, 2)
+        mg_layout.setSpacing(4)
+        mg_layout.addWidget(QLabel("Modo"))
+        mode_combo = QComboBox()
+        mode_combo.setObjectName("calibSpin")
+        mode_combo.addItems(["points", "model"])
+        mg_layout.addWidget(mode_combo, 1)
+        layout.addWidget(mode_group)
+        spins["mode"] = mode_combo
+
+        # Parámetros de orientación
+        cam_params = [
+            ("Pitch",  "°", -30.0, 30.0, 0.1,  -8.0),
+            ("Yaw",    "°", -30.0, 30.0, 0.1,   0.0),
+            ("Roll",   "°", -15.0, 15.0, 0.1,   0.0),
+            ("Altura", "m",  0.05,  1.0, 0.001, 0.230),
+            ("Offset", "mm",-100.0,100.0, 0.5,  32.5),
+        ]
+
+        for name, unit, vmin, vmax, step, default in cam_params:
+            group = QFrame()
+            group.setObjectName("calibPointGroup")
+            glayout = QHBoxLayout(group)
+            glayout.setContentsMargins(4, 2, 4, 2)
+            glayout.setSpacing(4)
+
+            lbl = QLabel(name)
+            lbl.setObjectName("calibPointLabel")
+            lbl.setFixedWidth(42)
+
+            spin = QDoubleSpinBox()
+            spin.setObjectName("calibSpin")
+            spin.setRange(vmin, vmax)
+            spin.setSingleStep(step)
+            spin.setDecimals(3)
+            spin.setSuffix(f" {unit}")
+            spin.setValue(default)
+
+            glayout.addWidget(lbl)
+            glayout.addWidget(spin, 1)
+            layout.addWidget(group)
+            spins[name.lower()] = spin
+
+        layout.addStretch()
+        return {"widget": widget, "spins": spins}
 
     def _on_apply(self):
         src_flat = self._get_values(self.src_spins)
         dst_flat = self._get_values(self.dst_spins)
         self.signals.set_bev_params.emit(src_flat, dst_flat)
-        self.status_lbl.setText("⬤ Enviado al nodo")
+        self.status_lbl.setText("⬤ Puntos enviados")
+        self.status_lbl.setStyleSheet("color: #69FF47;")
+
+    def _on_apply_camera(self):
+        """Lee los valores del tab Cámara y los envía al nodo C++."""
+        s = self.camera_tab["spins"]
+        params = {
+            "bev_mode":              s["mode"].currentText(),
+            "camera_pitch":          np.deg2rad(s["pitch"].value()),
+            "camera_yaw":            np.deg2rad(s["yaw"].value()),
+            "camera_roll":           np.deg2rad(s["roll"].value()),
+            "camera_height":         s["altura"].value(),
+            "camera_lateral_offset": s["offset"].value() / 1000.0,  # mm → m
+        }
+        self.signals.set_camera_params.emit(params)
+        self.status_lbl.setText(f"📷 Cámara ({s['mode'].currentText()})")
         self.status_lbl.setStyleSheet("color: #69FF47;")
 
     def _on_reset(self):
         self._set_values(self.src_spins, self.DEFAULT_SRC)
         self._set_values(self.dst_spins, self.DEFAULT_DST)
+        # Reset camera tab
+        s = self.camera_tab["spins"]
+        s["mode"].setCurrentIndex(0)  # "points"
+        s["pitch"].setValue(-8.0)
+        s["yaw"].setValue(0.0)
+        s["roll"].setValue(0.0)
+        s["altura"].setValue(0.230)
+        s["offset"].setValue(32.5)
         self.status_lbl.setText("↻ Valores por defecto")
         self.status_lbl.setStyleSheet("color: #FFA726;")
 
@@ -490,10 +762,14 @@ class LaneDebugWindow(QMainWindow):
         labels_row1 = self.PIPELINE_LABELS[3:]
 
         for col, label in enumerate(labels_row0):
-            panel = ImagePanel(label)
+            interactive = (label == "Original")
+            panel = ImagePanel(label, interactive=interactive)
             self.panels[label] = panel
             grid.addWidget(panel, 0, col)
-
+            
+            if interactive:
+                # Sincronizar puntos arrastrados con spinboxes
+                panel.image_lbl.point_dragged.connect(self._on_panel_point_drag_update)
         for col, label in enumerate(labels_row1):
             panel = ImagePanel(label)
             self.panels[label] = panel
@@ -530,18 +806,22 @@ class LaneDebugWindow(QMainWindow):
 
         self.pause_btn = QPushButton("Pause")
         self.pause_btn.setObjectName("ctrlButton")
+        self.back_btn = QPushButton("Back")
+        self.back_btn.setObjectName("ctrlButton")
         self.step_btn = QPushButton("Step")
         self.step_btn.setObjectName("ctrlButton")
         self.reset_btn = QPushButton("Reset")
         self.reset_btn.setObjectName("ctrlButton")
 
         self.pause_btn.clicked.connect(self._on_pause_resume)
+        self.back_btn.clicked.connect(self._on_back)
         self.step_btn.clicked.connect(self._on_step)
         self.reset_btn.clicked.connect(self._on_reset)
 
         layout.addWidget(title)
         layout.addStretch()
         layout.addWidget(self.pause_btn)
+        layout.addWidget(self.back_btn)
         layout.addWidget(self.step_btn)
         layout.addWidget(self.reset_btn)
         layout.addWidget(self.status_lbl)
@@ -555,7 +835,25 @@ class LaneDebugWindow(QMainWindow):
     def _connect_signals(self):
         self.signals.image_received.connect(self._on_image_received)
         self.signals.errors_received.connect(self._on_errors_received)
+        
+        # Enviar puntos iniciales al panel interactivo
+        pts = self.calib_panel.get_src_points()
+        self.panels["Original"].image_lbl.set_points(pts)
+        
+        # Suscribirse a cambios en los spinboxes para actualizar el overlay
+        for sx, sy in self.calib_panel.src_spins["spins"]:
+            sx.valueChanged.connect(self._update_overlay_from_gui)
+            sy.valueChanged.connect(self._update_overlay_from_gui)
 
+    def _on_panel_point_drag_update(self, idx, x, y):
+        """Callback cuando se arrastra un punto en el panel 'Original'."""
+        self.calib_panel.set_src_point(idx, x, y)
+        # El cambio en el spinbox disparará _update_overlay_from_gui
+
+    def _update_overlay_from_gui(self):
+        """Actualiza los puntos dibujados en el panel 'Original' leyendo los spinboxes."""
+        pts = self.calib_panel.get_src_points()
+        self.panels["Original"].image_lbl.set_points(pts)
     def _on_image_received(self, label: str, frame: np.ndarray):
         if label in self.panels:
             self.panels[label].update_frame(frame)
@@ -580,6 +878,11 @@ class LaneDebugWindow(QMainWindow):
         self.is_paused = True
         self.pause_btn.setText("Resume")
 
+    def _on_back(self):
+        self.signals.control_command.emit("back")
+        self.is_paused = True
+        self.pause_btn.setText("Resume")
+
     def _on_reset(self):
         self.signals.control_command.emit("reset")
 
@@ -589,6 +892,9 @@ class LaneDebugWindow(QMainWindow):
             return
         if event.key() == Qt.Key_Right:
             self._on_step()
+            return
+        if event.key() == Qt.Key_Left:
+            self._on_back()
             return
         if event.key() == Qt.Key_R:
             self._on_reset()

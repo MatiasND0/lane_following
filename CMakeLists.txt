@@ -18,11 +18,16 @@ find_package(OpenCV REQUIRED)
 
 add_executable(lane_pipeline_node
   src/main.cpp
-  src/pipeline/lane_pipeline_node.cpp
+  src/lane_pipeline_node.cpp
+  src/preprocessor.cpp
+  src/bev_transformer.cpp
+  src/sliding_window.cpp
+  src/lane_tracker.cpp
+  src/error_calculator.cpp
 )
 
 target_include_directories(lane_pipeline_node PRIVATE
-  ${CMAKE_CURRENT_SOURCE_DIR}/src/pipeline
+  ${CMAKE_CURRENT_SOURCE_DIR}/include
 )
 
 ament_target_dependencies(lane_pipeline_node
