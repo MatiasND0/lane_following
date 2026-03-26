@@ -1,6 +1,7 @@
 #include "lane_detection/sliding_window.hpp"
 
 #include <opencv2/imgproc.hpp>
+#include <opencv2/video/tracking.hpp>
 
 #include <algorithm>
 #include <cmath>
@@ -120,6 +121,50 @@ LaneState detect_lanes(const cv::Mat& bev_binary, cv::Mat& viz,
         state.center.a = state.right.a;
         state.center.b = state.right.b;
         state.center.c = state.right.c - lane_px / 2.0;
+        state.center.valid = true;
+    }
+
+    // --- Kalman sobre centro (a, b, c) ---
+    static cv::KalmanFilter kf;
+    static bool kf_configured = false;
+    static bool kf_initialized = false;
+
+    if (!kf_configured) {
+        kf.init(3, 3, 0, CV_32F);
+        kf.transitionMatrix = cv::Mat::eye(3, 3, CV_32F);
+        kf.measurementMatrix = cv::Mat::eye(3, 3, CV_32F);
+        kf.processNoiseCov = cv::Mat::eye(3, 3, CV_32F) * 1e-4f;
+        kf.measurementNoiseCov = cv::Mat::eye(3, 3, CV_32F) * 1e-2f;
+        kf.errorCovPost = cv::Mat::eye(3, 3, CV_32F);
+        kf_configured = true;
+    }
+
+    cv::Mat prediction;
+    if (kf_initialized) {
+        prediction = kf.predict();
+    }
+
+    if (state.center.valid) {
+        cv::Mat measurement(3, 1, CV_32F);
+        measurement.at<float>(0, 0) = static_cast<float>(state.center.a);
+        measurement.at<float>(1, 0) = static_cast<float>(state.center.b);
+        measurement.at<float>(2, 0) = static_cast<float>(state.center.c);
+
+        if (!kf_initialized) {
+            kf.statePost = measurement.clone();
+            kf.statePre = measurement.clone();
+            kf_initialized = true;
+        } else {
+            const cv::Mat estimated = kf.correct(measurement);
+            state.center.a = static_cast<double>(estimated.at<float>(0, 0));
+            state.center.b = static_cast<double>(estimated.at<float>(1, 0));
+            state.center.c = static_cast<double>(estimated.at<float>(2, 0));
+            state.center.valid = true;
+        }
+    } else if (kf_initialized) {
+        state.center.a = static_cast<double>(prediction.at<float>(0, 0));
+        state.center.b = static_cast<double>(prediction.at<float>(1, 0));
+        state.center.c = static_cast<double>(prediction.at<float>(2, 0));
         state.center.valid = true;
     }
 
