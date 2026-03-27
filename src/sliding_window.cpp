@@ -10,6 +10,7 @@
  * sliding_window.cpp
  * -------------------
  * Detección de líneas por sliding window + ajuste polinomial grado 2.
+ * Mejorado con inferencia de carril, validación de Ego Center y filtrado por inercia/mediana.
  */
 
 namespace lane_detection {
@@ -32,24 +33,80 @@ LaneState detect_lanes(const cv::Mat& bev_binary, cv::Mat& viz,
     const double lane_px = p.lane_width_m / p.bev_scale_mpp;
     const int min_separation_px = static_cast<int>(0.5 * lane_px);
 
+    // Variables estáticas para mantener memoria del cuadro anterior si perdemos ambas líneas
+    static int last_left_x = (bev_w / 2) - static_cast<int>(lane_px / 2.0);
+    static int last_right_x = (bev_w / 2) + static_cast<int>(lane_px / 2.0);
+
     // Histograma de mitad inferior
     cv::Mat bottom_half = bev_binary(cv::Rect(0, bev_h / 2, bev_w, bev_h / 2));
     cv::Mat hist;
     cv::reduce(bottom_half, hist, 0, cv::REDUCE_SUM, CV_32F);
 
-    // Picos L/R
     const int mid = bev_w / 2;
-    cv::Point left_peak_loc;
-    cv::Point right_peak_loc;
-    double max_val = 0.0;
+    cv::Point left_peak_loc, right_peak_loc;
+    double max_val_l = 0.0, max_val_r = 0.0;
 
-    cv::minMaxLoc(hist(cv::Rect(0, 0, mid, 1)),
-                  nullptr, &max_val, nullptr, &left_peak_loc);
-    cv::minMaxLoc(hist(cv::Rect(mid, 0, mid, 1)),
-                  nullptr, &max_val, nullptr, &right_peak_loc);
+    // --- MEJORA 1: BÚSQUEDA LOCALIZADA DEL HISTOGRAMA ---
+    const int search_margin = p.win_half_w * 2;
+
+    // Límites para la izquierda
+    int l_min = std::max(0, last_left_x - search_margin);
+    int l_max = std::min(mid - 1, last_left_x + search_margin);
+    if (l_max > l_min) {
+        cv::minMaxLoc(hist(cv::Rect(l_min, 0, l_max - l_min, 1)), nullptr, &max_val_l, nullptr, &left_peak_loc);
+        left_peak_loc.x += l_min; 
+    }
+
+    // Límites para la derecha
+    int r_min = std::max(mid, last_right_x - search_margin);
+    int r_max = std::min(bev_w - 1, last_right_x + search_margin);
+    if (r_max > r_min) {
+        cv::minMaxLoc(hist(cv::Rect(r_min, 0, r_max - r_min, 1)), nullptr, &max_val_r, nullptr, &right_peak_loc);
+        right_peak_loc.x += r_min; 
+    }
 
     int cur_left_x  = left_peak_loc.x;
-    int cur_right_x = right_peak_loc.x + mid;
+    int cur_right_x = right_peak_loc.x;
+
+    // --- LÓGICA DE ROBUSTEZ: Validación desde el Ego Center ---
+    const double intensity_threshold = p.min_pixels * 3.0; 
+    
+    bool left_valid = max_val_l > intensity_threshold;
+    bool right_valid = max_val_r > intensity_threshold;
+
+    const int ego_center = bev_w / 2;
+    const double expected_dist = lane_px / 2.0;
+    const double tolerance = expected_dist * 0.4; // 40% de tolerancia
+
+    // 1. Validar la línea IZQUIERDA respecto al auto
+    if (left_valid) {
+        double dist_to_center = ego_center - cur_left_x;
+        if (dist_to_center < 0 || dist_to_center > (expected_dist + tolerance)) {
+            left_valid = false;
+        }
+    }
+
+    // 2. Validar la línea DERECHA respecto al auto
+    if (right_valid) {
+        double dist_to_center = cur_right_x - ego_center;
+        if (dist_to_center < 0 || dist_to_center > (expected_dist + tolerance)) {
+            right_valid = false;
+        }
+    }
+
+    // 3. Inferir la posición faltante
+    if (left_valid && !right_valid) {
+        cur_right_x = cur_left_x + static_cast<int>(lane_px);
+    } else if (!left_valid && right_valid) {
+        cur_left_x = cur_right_x - static_cast<int>(lane_px);
+    } else if (!left_valid && !right_valid) {
+        cur_left_x = last_left_x;
+        cur_right_x = last_right_x;
+    }
+
+    last_left_x = cur_left_x;
+    last_right_x = cur_right_x;
+    // --- FIN LÓGICA DE ROBUSTEZ ---
 
     std::vector<cv::Point2f> left_pts;
     std::vector<cv::Point2f> right_pts;
@@ -71,27 +128,39 @@ LaneState detect_lanes(const cv::Mat& bev_binary, cv::Mat& viz,
             cv::findNonZero(window, nz);
 
             std::vector<cv::Point2f> accepted_pts;
+            std::vector<float> x_coords; 
             accepted_pts.reserve(nz.size());
-            double sum_x = 0.0;
+            x_coords.reserve(nz.size());
+            
             for (const auto& pt : nz) {
                 const int global_x = pt.x + x_low;
                 if (exclude_near_left && std::abs(global_x - cur_left_x) < min_separation_px) {
                     continue;
                 }
-
-                sum_x += global_x;
-                accepted_pts.emplace_back(static_cast<float>(global_x),
-                                          static_cast<float>(pt.y + y_low));
+                accepted_pts.emplace_back(static_cast<float>(global_x), static_cast<float>(pt.y + y_low));
+                x_coords.push_back(static_cast<float>(global_x));
             }
 
-            if (static_cast<int>(accepted_pts.size()) >= p.min_pixels) {
-                double sum_x = 0.0;
-                for (const auto& p_acc : accepted_pts) {
-                    sum_x += p_acc.x;
-                }
-                cx = static_cast<int>(sum_x / static_cast<double>(accepted_pts.size()));
+            const int window_energy = static_cast<int>(accepted_pts.size());
 
-                pts.insert(pts.end(), accepted_pts.begin(), accepted_pts.end());
+            if (window_energy >= p.min_pixels) {
+                // --- MEJORA 2: USO DE MEDIANA EN LUGAR DE PROMEDIO ---
+                std::sort(x_coords.begin(), x_coords.end());
+                int new_cx = static_cast<int>(x_coords[x_coords.size() / 2]);
+
+                // Inercia
+                const int max_shift_px = static_cast<int>(p.win_half_w * 0.4); 
+                int delta_x = new_cx - cx;
+
+                if (std::abs(delta_x) > max_shift_px) {
+                    cx += (delta_x > 0) ? max_shift_px : -max_shift_px;
+                } else {
+                    cx = new_cx;
+                }
+
+                if (window_energy >= static_cast<int>(p.min_pixels * 1.2)) {
+                    pts.insert(pts.end(), accepted_pts.begin(), accepted_pts.end());
+                }
             }
 
             return cx;
@@ -105,28 +174,8 @@ LaneState detect_lanes(const cv::Mat& bev_binary, cv::Mat& viz,
     state.left  = fit_polynomial(left_pts, bev_h);
     state.right = fit_polynomial(right_pts, bev_h);
 
-    // --- Robustez: evitar detectar la misma línea como L/R ---
-    if (state.left.valid && state.right.valid) {
-        const double y_base = static_cast<double>(bev_h);
-        const double x_left = state.left.a * y_base * y_base + state.left.b * y_base + state.left.c;
-        const double x_right = state.right.a * y_base * y_base + state.right.b * y_base + state.right.c;
-        const double dist_px = std::abs(x_right - x_left);
-
-        if (dist_px < 0.5 * lane_px) {
-            state.right.valid = false;
-        }
-    }
-
-    if (state.left.valid && state.right.valid) {
-        constexpr double small_slope_threshold = 0.02;
-        if (std::abs(state.left.b - state.right.b) < small_slope_threshold) {
-            state.right.valid = false;
-        }
-    }
-
     // --- Validación de ancho del carril ---
     if (state.left.valid && state.right.valid) {
-        // Evaluar c_R - c_L en y = bev_h (base de la imagen)
         const double y_base = static_cast<double>(bev_h);
         const double u_L = state.left.a  * y_base * y_base + state.left.b  * y_base + state.left.c;
         const double u_R = state.right.a * y_base * y_base + state.right.b * y_base + state.right.c;

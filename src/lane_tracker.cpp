@@ -28,13 +28,6 @@ void LaneTracker::update(const LaneState& raw) {
             return;
         }
 
-        // Rechazo de salto espurio de curvatura:
-        // si |a_raw - a_prev| / (|a_prev| + ε) > 1.5 → no actualizar
-        if (std::abs(raw_c.a) > 0.0 &&
-            std::abs(raw_c.a - filtered.a) / (std::abs(filtered.a) + 1e-9) > 1.5) {
-            return;
-        }
-
         filtered.a = a * raw_c.a + (1.0 - a) * filtered.a;
         filtered.b = a * raw_c.b + (1.0 - a) * filtered.b;
         filtered.c = a * raw_c.c + (1.0 - a) * filtered.c;

@@ -98,6 +98,10 @@ private:
 
     // BevConfig cacheado para error_calculator
     BevConfig bev_cfg_;
+
+    // Último error válido para publicar un triplete por frame
+    LaneErrors last_valid_errors_;
+    bool has_last_valid_errors_ = false;
 };
 
 // ---------------------------------------------------------------------------
@@ -343,17 +347,27 @@ void LanePipelineNode::process_next_frame() {
     const auto errors = lane_detection::compute_lane_errors(
         lane_tracker_.state(), bev_cfg_);
 
+    LaneErrors to_publish;
     if (errors.valid) {
-        std_msgs::msg::Float32MultiArray msg;
-        msg.data = {
-            static_cast<float>(errors.e2),
-            static_cast<float>(errors.e3),
-            static_cast<float>(errors.k)
-        };
-        pub_errors_->publish(msg);
-        RCLCPP_DEBUG(get_logger(), "e2=%.4f m  e3=%.4f rad  k=%.4f m^-1",
-                     errors.e2, errors.e3, errors.k);
+        last_valid_errors_ = errors;
+        has_last_valid_errors_ = true;
+        to_publish = errors;
+    } else if (has_last_valid_errors_) {
+        to_publish = last_valid_errors_;
     }
+
+    std_msgs::msg::Float32MultiArray msg;
+    msg.data = {
+        static_cast<float>(to_publish.e2),
+        static_cast<float>(to_publish.e3),
+        static_cast<float>(to_publish.k)
+    };
+    pub_errors_->publish(msg);
+
+    RCLCPP_DEBUG(get_logger(),
+                 "e2=%.4f m  e3=%.4f rad  k=%.4f m^-1%s",
+                 to_publish.e2, to_publish.e3, to_publish.k,
+                 errors.valid ? "" : (has_last_valid_errors_ ? " (hold)" : " (zero)"));
 }
 
 // ---------------------------------------------------------------------------
@@ -385,6 +399,8 @@ void LanePipelineNode::on_control_cmd(const std_msgs::msg::String::SharedPtr msg
     } else if (cmd == "reset") {
         frame_idx_ = 0;
         lane_tracker_.reset();
+        has_last_valid_errors_ = false;
+        last_valid_errors_ = LaneErrors{};
         RCLCPP_INFO(get_logger(), "Control: reset (frame_idx=0)");
     } else {
         RCLCPP_WARN(get_logger(),
