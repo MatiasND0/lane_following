@@ -184,11 +184,7 @@ namespace lane_detection
         state.right = fit_polynomial(right_pts, bev_h);
 
         // ==========================================================================
-        // MHT MEJORADO CON SIMILITUD DE FORMA
-        // ==========================================================================
-
-        // ==========================================================================
-        // MHT CON SEMÁNTICA DESACOPLADA (5 HIPÓTESIS)
+        // MHT CON SEMÁNTICA DESACOPLADA Y VALIDACIÓN DE EGO-CENTER
         // ==========================================================================
         static PolyCoeffs last_best_center;
         static bool has_history = false;
@@ -198,18 +194,18 @@ namespace lane_detection
             PolyCoeffs poly;
             double error_pos;
             double error_shape;
+            double error_ego; // NUEVO: Penalización por estar fuera del auto
             double total_error;
             bool valid;
-            cv::Scalar color; // Para debug visual
+            cv::Scalar color;
         };
 
-        Hypothesis h_both = {{0, 0, 0, false}, 1e9, 1e9, 1e9, false, cv::Scalar(255, 0, 255)};     // Fucsia
-        Hypothesis h_L_is_L = {{0, 0, 0, false}, 1e9, 1e9, 1e9, false, cv::Scalar(255, 255, 0)};   // Cian
-        Hypothesis h_L_is_R = {{0, 0, 0, false}, 1e9, 1e9, 1e9, false, cv::Scalar(255, 255, 255)}; // Blanco (Tu caso!)
-        Hypothesis h_R_is_R = {{0, 0, 0, false}, 1e9, 1e9, 1e9, false, cv::Scalar(0, 255, 255)};   // Amarillo
-        Hypothesis h_R_is_L = {{0, 0, 0, false}, 1e9, 1e9, 1e9, false, cv::Scalar(0, 0, 255)};     // Rojo
+        Hypothesis h_both = {{0, 0, 0, false}, 1e9, 1e9, 1e9, 1e9, false, cv::Scalar(255, 0, 255)};     // Fucsia
+        Hypothesis h_L_is_L = {{0, 0, 0, false}, 1e9, 1e9, 1e9, 1e9, false, cv::Scalar(255, 255, 0)};   // Cian
+        Hypothesis h_L_is_R = {{0, 0, 0, false}, 1e9, 1e9, 1e9, 1e9, false, cv::Scalar(255, 255, 255)}; // Blanco
+        Hypothesis h_R_is_R = {{0, 0, 0, false}, 1e9, 1e9, 1e9, 1e9, false, cv::Scalar(0, 255, 255)};   // Amarillo
+        Hypothesis h_R_is_L = {{0, 0, 0, false}, 1e9, 1e9, 1e9, 1e9, false, cv::Scalar(0, 0, 255)};     // Rojo
 
-        // 1. Ambas líneas son correctas (solo si la distancia entre ellas tiene sentido)
         if (state.left.valid && state.right.valid)
         {
             double dist = std::abs(state.right.c - state.left.c);
@@ -223,30 +219,28 @@ namespace lane_detection
             }
         }
 
-        // 2 y 3. Hipótesis sobre la ventana "Izquierda" (Azul)
         if (state.left.valid)
         {
             h_L_is_L.poly = state.left;
-            h_L_is_L.poly.c += (lane_px / 2.0); // Asumimos que es la Izquierda -> Centro a la derecha
+            h_L_is_L.poly.c += (lane_px / 2.0);
             h_L_is_L.poly.valid = true;
             h_L_is_L.valid = true;
 
             h_L_is_R.poly = state.left;
-            h_L_is_R.poly.c -= (lane_px / 2.0); // Asumimos que es la Derecha -> Centro a la izquierda
+            h_L_is_R.poly.c -= (lane_px / 2.0);
             h_L_is_R.poly.valid = true;
             h_L_is_R.valid = true;
         }
 
-        // 4 y 5. Hipótesis sobre la ventana "Derecha" (Naranja)
         if (state.right.valid)
         {
             h_R_is_R.poly = state.right;
-            h_R_is_R.poly.c -= (lane_px / 2.0); // Asumimos que es la Derecha -> Centro a la izquierda
+            h_R_is_R.poly.c -= (lane_px / 2.0);
             h_R_is_R.poly.valid = true;
             h_R_is_R.valid = true;
 
             h_R_is_L.poly = state.right;
-            h_R_is_L.poly.c += (lane_px / 2.0); // Asumimos que es la Izquierda -> Centro a la derecha
+            h_R_is_L.poly.c += (lane_px / 2.0);
             h_R_is_L.poly.valid = true;
             h_R_is_L.valid = true;
         }
@@ -255,7 +249,6 @@ namespace lane_detection
 
         if (!has_history)
         {
-            // Inicialización: Buscamos la que ponga el centro más cerca de la mitad del auto (bev_w/2)
             double best_c_dist = 1e9;
             std::vector<Hypothesis *> init_hyps = {&h_both, &h_L_is_L, &h_L_is_R, &h_R_is_R, &h_R_is_L};
             for (auto h : init_hyps)
@@ -286,11 +279,9 @@ namespace lane_detection
                 std::vector<std::pair<double, double>> y_evals = {{static_cast<double>(bev_h), 1.0}, {bev_h * 0.6, 0.5}};
                 for (auto &y_w : y_evals)
                 {
-                    double y = y_w.first;
-                    double weight = y_w.second;
-                    double x_cand = cand.a * y * y + cand.b * y + cand.c;
-                    double x_hist = last_best_center.a * y * y + last_best_center.b * y + last_best_center.c;
-                    err += std::abs(x_cand - x_hist) * weight;
+                    double x_cand = cand.a * y_w.first * y_w.first + cand.b * y_w.first + cand.c;
+                    double x_hist = last_best_center.a * y_w.first * y_w.first + last_best_center.b * y_w.first + last_best_center.c;
+                    err += std::abs(x_cand - x_hist) * y_w.second;
                 }
                 return err / 1.5;
             };
@@ -304,9 +295,27 @@ namespace lane_detection
                 return diff_a + diff_b;
             };
 
+            // --- NUEVA MÉTRICA: ERROR DE EGO-CENTER ---
+            auto calc_ego_error = [&](const PolyCoeffs &cand) -> double
+            {
+                if (!cand.valid)
+                    return 1e9;
+                // Evaluamos la X del polinomio en la parte inferior de la imagen (donde está el auto)
+                double x_bottom = cand.a * bev_h * bev_h + cand.b * bev_h + cand.c;
+                double dist_from_ego = std::abs(x_bottom - (bev_w / 2.0));
+
+                // Límite: 70% del ancho del carril. Si está más lejos, es el carril vecino.
+                if (dist_from_ego > lane_px * 0.70)
+                {
+                    return 10000.0; // Penalización mortal (Muro de ladrillos)
+                }
+
+                // Penalidad suave para desempatar a favor de la más centrada si la historia es dudosa
+                return dist_from_ego * 0.1;
+            };
+
             std::vector<Hypothesis *> hyps = {&h_both, &h_L_is_L, &h_L_is_R, &h_R_is_R, &h_R_is_L};
 
-            // Bonus artificial para 'h_both' si es válida (preferimos usar ambas líneas si tiene sentido)
             if (h_both.valid)
                 h_both.total_error -= 10.0;
 
@@ -316,8 +325,10 @@ namespace lane_detection
                 {
                     h->error_pos = calc_pos_error(h->poly);
                     h->error_shape = calc_shape_error(h->poly);
-                    // Calculamos el error total (penalizando fuerte si la curva es distinta)
-                    h->total_error = h->error_pos + (h->error_shape * 25.0);
+                    h->error_ego = calc_ego_error(h->poly); // Agregamos la evaluación
+
+                    // Sumamos el error_ego a la cuenta total
+                    h->total_error = h->error_pos + (h->error_shape * 25.0) + h->error_ego;
                 }
             }
 
@@ -338,7 +349,6 @@ namespace lane_detection
             {
                 state.center = best_h->poly;
 
-                // Suavizado temporal
                 const double alpha_smooth = 0.15;
                 last_best_center.a = (alpha_smooth * state.center.a) + ((1.0 - alpha_smooth) * last_best_center.a);
                 last_best_center.b = (alpha_smooth * state.center.b) + ((1.0 - alpha_smooth) * last_best_center.b);
@@ -353,10 +363,9 @@ namespace lane_detection
         // ==========================================================================
         // VISUALIZACIÓN DE DEPURACIÓN
         // ==========================================================================
-        draw_polynomial(viz, state.left, bev_h, cv::Scalar(255, 200, 0), 2);  // Azul tracker
-        draw_polynomial(viz, state.right, bev_h, cv::Scalar(0, 100, 255), 2); // Naranja tracker
+        draw_polynomial(viz, state.left, bev_h, cv::Scalar(255, 200, 0), 2);
+        draw_polynomial(viz, state.right, bev_h, cv::Scalar(0, 100, 255), 2);
 
-        // Dibujar las 5 hipótesis
         std::vector<Hypothesis *> all_hyps = {&h_both, &h_L_is_L, &h_L_is_R, &h_R_is_R, &h_R_is_L};
         for (auto h : all_hyps)
         {
@@ -364,7 +373,6 @@ namespace lane_detection
                 draw_polynomial(viz, h->poly, bev_h, h->color, 1);
         }
 
-        // Dibujar el centro ganador (Verde grueso)
         draw_polynomial(viz, state.center, bev_h, cv::Scalar(0, 255, 0), 3);
 
         return state;
