@@ -2,7 +2,7 @@
 """
 extract_frames.py
 -----------------
-Extrae frames del topic /telemetry/camera_record/compressed
+Extrae frames de un topic de cámara (comprimido o raw)
 de un rosbag2 y los guarda como .jpg en una carpeta de salida.
 
 Uso:
@@ -79,6 +79,69 @@ def _decode_frame_from_serialized(raw_data: bytes):
     return None
 
 
+def _decode_raw_sensor_image(msg):
+    """
+    Convierte un sensor_msgs/msg/Image (raw) a imagen BGR (OpenCV).
+    """
+    encoding = (msg.encoding or "").lower()
+    height = int(msg.height)
+    width = int(msg.width)
+    step = int(msg.step)
+
+    if height <= 0 or width <= 0 or step <= 0:
+        return None
+
+    # Encodings de 8 bits por canal
+    if encoding in {
+        "bgr8", "rgb8", "bgra8", "rgba8", "mono8", "8uc1", "8uc3", "8uc4"
+    }:
+        channels_map = {
+            "mono8": 1,
+            "8uc1": 1,
+            "bgr8": 3,
+            "rgb8": 3,
+            "8uc3": 3,
+            "bgra8": 4,
+            "rgba8": 4,
+            "8uc4": 4,
+        }
+        channels = channels_map.get(encoding, 3)
+        row_bytes = width * channels
+
+        buf = np.frombuffer(msg.data, dtype=np.uint8)
+        if buf.size < height * step:
+            return None
+
+        rows = buf[: height * step].reshape((height, step))
+        if row_bytes > step:
+            return None
+        img = rows[:, :row_bytes].reshape((height, width, channels))
+
+        if channels == 1:
+            return cv2.cvtColor(img.reshape((height, width)), cv2.COLOR_GRAY2BGR)
+        if encoding in {"rgb8"}:
+            return cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+        if encoding in {"rgba8"}:
+            return cv2.cvtColor(img, cv2.COLOR_RGBA2BGR)
+        if encoding in {"bgra8"}:
+            return cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
+        return img
+
+    # Encodings de 16 bits (se normaliza a 8 bits para guardar JPG)
+    if encoding in {"mono16", "16uc1"}:
+        if step < width * 2:
+            return None
+        buf = np.frombuffer(msg.data, dtype=np.uint8)
+        if buf.size < height * step:
+            return None
+        rows = buf[: height * step].reshape((height, step))[:, : width * 2]
+        img16 = rows.reshape((height, width, 2)).view(np.uint16).reshape((height, width))
+        img8 = cv2.convertScaleAbs(img16, alpha=(255.0 / 65535.0))
+        return cv2.cvtColor(img8, cv2.COLOR_GRAY2BGR)
+
+    return None
+
+
 def extract_frames(bag_path: str, output_dir: str, every_n: int, topic: str):
     try:
         import rclpy
@@ -112,6 +175,9 @@ def extract_frames(bag_path: str, output_dir: str, every_n: int, topic: str):
         sys.exit(1)
 
     msg_type = get_message(type_map[topic])
+    msg_type_name = type_map[topic]
+    is_compressed_topic = msg_type_name == "sensor_msgs/msg/CompressedImage"
+    is_raw_topic = msg_type_name == "sensor_msgs/msg/Image"
 
     filter_ = rosbag2_py.StorageFilter(topics=[topic])
     reader.set_filter(filter_)
@@ -121,6 +187,8 @@ def extract_frames(bag_path: str, output_dir: str, every_n: int, topic: str):
     decode_fail_count = 0
     warned_fallback = False
     warned_zstd = False
+    warned_unknown_encoding = False
+    warned_raw_deserialize = False
 
     print(f"[INFO] Leyendo bag: {bag_path}")
     print(f"[INFO] Topic: {topic}")
@@ -143,17 +211,38 @@ def extract_frames(bag_path: str, output_dir: str, every_n: int, topic: str):
         # Camino principal: deserialización ROS2 estándar.
         try:
             msg = deserialize_message(raw_data, msg_type)
-            np_arr = np.frombuffer(msg.data, dtype=np.uint8)
-            frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+            if is_compressed_topic:
+                np_arr = np.frombuffer(msg.data, dtype=np.uint8)
+                frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+            elif is_raw_topic:
+                frame = _decode_raw_sensor_image(msg)
+                if frame is None and not warned_unknown_encoding:
+                    print(
+                        f"[WARN] Encoding raw no soportado o inválido: '{msg.encoding}'."
+                    )
+                    warned_unknown_encoding = True
+            else:
+                # Heurística: si no es tipo conocido, intentar como comprimida.
+                np_arr = np.frombuffer(msg.data, dtype=np.uint8)
+                frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
         except Exception:
             # Fallback para bags con incompatibilidades de CDR/XCDR.
-            frame = _decode_frame_from_serialized(raw_data)
-            if frame is not None and not warned_fallback:
-                print(
-                    "[WARN] Falló la deserialización ROS2 estándar; "
-                    "usando extracción directa del payload comprimido."
-                )
-                warned_fallback = True
+            if is_compressed_topic:
+                frame = _decode_frame_from_serialized(raw_data)
+                if frame is not None and not warned_fallback:
+                    print(
+                        "[WARN] Falló la deserialización ROS2 estándar; "
+                        "usando extracción directa del payload comprimido."
+                    )
+                    warned_fallback = True
+            else:
+                frame = None
+                if not warned_raw_deserialize:
+                    print(
+                        "[WARN] Falló la deserialización ROS2 en topic raw; "
+                        "no se puede aplicar fallback por bytes comprimidos."
+                    )
+                    warned_raw_deserialize = True
 
         if frame is None:
             print(f"[WARN] Frame {frame_count} no pudo decodificarse, saltando.")
@@ -177,9 +266,10 @@ def extract_frames(bag_path: str, output_dir: str, every_n: int, topic: str):
     print(f"     Frames no decodificados: {decode_fail_count}")
     print(f"     Directorio             : {output_dir}")
 
-    if frame_count > 0 and saved_count < max(5, int(frame_count * 0.5)):
+    expected_saved = max(1, frame_count // max(1, every_n))
+    if frame_count > 0 and saved_count < max(5, int(expected_saved * 0.5)):
         print("[WARN] Se guardaron pocos frames respecto a los leídos.")
-        print("       Revisá que el --topic sea el correcto para imágenes comprimidas.")
+        print("       Revisá que el --topic sea correcto y el tipo/encoding de imagen sea compatible.")
 
 
 def main():
