@@ -26,7 +26,7 @@ cv::Mat compute_mask(const cv::Mat& bgr, const HlsParams& p) {
     cv::Mat yellow_mask;
     cv::inRange(hls,
         cv::Scalar(p.yellow_h_min, p.yellow_l_min, p.yellow_s_min),
-        cv::Scalar(p.yellow_h_max, 220, 255),
+        cv::Scalar(p.yellow_h_max, p.yellow_l_max, p.yellow_s_max),
         yellow_mask);
 
     // Fusión

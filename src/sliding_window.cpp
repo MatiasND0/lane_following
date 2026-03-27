@@ -5,315 +5,432 @@
 
 #include <algorithm>
 #include <cmath>
+#include <vector>
+#include <string>
 
 /**
  * sliding_window.cpp
  * -------------------
  * Detección de líneas por sliding window + ajuste polinomial grado 2.
- * Mejorado con inferencia de carril, validación de Ego Center y filtrado por inercia/mediana.
+ * Mejorado con inferencia, validación de Ego Center, filtrado por inercia/mediana,
+ * y Multiple Hypothesis Tracking (MHT) depurado con similitud de forma.
  */
 
-namespace lane_detection {
+namespace lane_detection
+{
 
-// --------------------------------------------------------------------------
-// Funciones internas (declaration-only en este TU)
-// --------------------------------------------------------------------------
+    // --------------------------------------------------------------------------
+    // Funciones internas (declaration-only en este TU)
+    // --------------------------------------------------------------------------
 
-static PolyCoeffs fit_polynomial(const std::vector<cv::Point2f>& pts, int img_height);
-static void draw_polynomial(cv::Mat& viz, const PolyCoeffs& c, int height, cv::Scalar color);
+    static PolyCoeffs fit_polynomial(const std::vector<cv::Point2f> &pts, int img_height);
+    static void draw_polynomial(cv::Mat &viz, const PolyCoeffs &c, int height, cv::Scalar color, int thickness = 2);
 
-// --------------------------------------------------------------------------
-// detect_lanes — punto de entrada principal
-// --------------------------------------------------------------------------
+    // --------------------------------------------------------------------------
+    // detect_lanes — punto de entrada principal
+    // --------------------------------------------------------------------------
 
-LaneState detect_lanes(const cv::Mat& bev_binary, cv::Mat& viz,
-                       int bev_w, int bev_h,
-                       const SlidingWindowParams& p) {
-    const int win_h = bev_h / p.n_windows;
-    const double lane_px = p.lane_width_m / p.bev_scale_mpp;
-    const int min_separation_px = static_cast<int>(0.5 * lane_px);
+    LaneState detect_lanes(const cv::Mat &bev_binary, cv::Mat &viz,
+                           int bev_w, int bev_h,
+                           const SlidingWindowParams &p)
+    {
+        const int win_h = bev_h / p.n_windows;
+        const double lane_px = p.lane_width_m / p.bev_scale_mpp;
+        const int min_separation_px = static_cast<int>(0.5 * lane_px);
 
-    // Variables estáticas para mantener memoria del cuadro anterior si perdemos ambas líneas
-    static int last_left_x = (bev_w / 2) - static_cast<int>(lane_px / 2.0);
-    static int last_right_x = (bev_w / 2) + static_cast<int>(lane_px / 2.0);
+        // Variables estáticas para mantener memoria de la posición inicial del histograma
+        static int last_left_hist_x = (bev_w / 2) - static_cast<int>(lane_px / 2.0);
+        static int last_right_hist_x = (bev_w / 2) + static_cast<int>(lane_px / 2.0);
 
-    // Histograma de mitad inferior
-    cv::Mat bottom_half = bev_binary(cv::Rect(0, bev_h / 2, bev_w, bev_h / 2));
-    cv::Mat hist;
-    cv::reduce(bottom_half, hist, 0, cv::REDUCE_SUM, CV_32F);
+        // Histograma de mitad inferior
+        cv::Mat bottom_half = bev_binary(cv::Rect(0, bev_h / 2, bev_w, bev_h / 2));
+        cv::Mat hist;
+        cv::reduce(bottom_half, hist, 0, cv::REDUCE_SUM, CV_32F);
 
-    const int mid = bev_w / 2;
-    cv::Point left_peak_loc, right_peak_loc;
-    double max_val_l = 0.0, max_val_r = 0.0;
+        const int mid = bev_w / 2;
+        cv::Point left_peak_loc, right_peak_loc;
+        double max_val_l = 0.0, max_val_r = 0.0;
 
-    // --- MEJORA 1: BÚSQUEDA LOCALIZADA DEL HISTOGRAMA ---
-    const int search_margin = p.win_half_w * 2;
+        // --- BÚSQUEDA LOCALIZADA DEL HISTOGRAMA (MEMORIA TEMPORAL DE INICIO) ---
+        const int search_margin_hist = p.win_half_w * 3;
 
-    // Límites para la izquierda
-    int l_min = std::max(0, last_left_x - search_margin);
-    int l_max = std::min(mid - 1, last_left_x + search_margin);
-    if (l_max > l_min) {
-        cv::minMaxLoc(hist(cv::Rect(l_min, 0, l_max - l_min, 1)), nullptr, &max_val_l, nullptr, &left_peak_loc);
-        left_peak_loc.x += l_min; 
-    }
-
-    // Límites para la derecha
-    int r_min = std::max(mid, last_right_x - search_margin);
-    int r_max = std::min(bev_w - 1, last_right_x + search_margin);
-    if (r_max > r_min) {
-        cv::minMaxLoc(hist(cv::Rect(r_min, 0, r_max - r_min, 1)), nullptr, &max_val_r, nullptr, &right_peak_loc);
-        right_peak_loc.x += r_min; 
-    }
-
-    int cur_left_x  = left_peak_loc.x;
-    int cur_right_x = right_peak_loc.x;
-
-    // --- LÓGICA DE ROBUSTEZ: Validación desde el Ego Center ---
-    const double intensity_threshold = p.min_pixels * 3.0; 
-    
-    bool left_valid = max_val_l > intensity_threshold;
-    bool right_valid = max_val_r > intensity_threshold;
-
-    const int ego_center = bev_w / 2;
-    const double expected_dist = lane_px / 2.0;
-    const double tolerance = expected_dist * 0.4; // 40% de tolerancia
-
-    // 1. Validar la línea IZQUIERDA respecto al auto
-    if (left_valid) {
-        double dist_to_center = ego_center - cur_left_x;
-        if (dist_to_center < 0 || dist_to_center > (expected_dist + tolerance)) {
-            left_valid = false;
+        int l_min = std::max(0, last_left_hist_x - search_margin_hist);
+        int l_max = std::min(mid - 1, last_left_hist_x + search_margin_hist);
+        if (l_max > l_min)
+        {
+            cv::minMaxLoc(hist(cv::Rect(l_min, 0, l_max - l_min, 1)), nullptr, &max_val_l, nullptr, &left_peak_loc);
+            left_peak_loc.x += l_min;
         }
-    }
-
-    // 2. Validar la línea DERECHA respecto al auto
-    if (right_valid) {
-        double dist_to_center = cur_right_x - ego_center;
-        if (dist_to_center < 0 || dist_to_center > (expected_dist + tolerance)) {
-            right_valid = false;
+        else
+        {
+            left_peak_loc.x = last_left_hist_x;
         }
-    }
 
-    // 3. Inferir la posición faltante
-    if (left_valid && !right_valid) {
-        cur_right_x = cur_left_x + static_cast<int>(lane_px);
-    } else if (!left_valid && right_valid) {
-        cur_left_x = cur_right_x - static_cast<int>(lane_px);
-    } else if (!left_valid && !right_valid) {
-        cur_left_x = last_left_x;
-        cur_right_x = last_right_x;
-    }
+        int r_min = std::max(mid, last_right_hist_x - search_margin_hist);
+        int r_max = std::min(bev_w - 1, last_right_hist_x + search_margin_hist);
+        if (r_max > r_min)
+        {
+            cv::minMaxLoc(hist(cv::Rect(r_min, 0, r_max - r_min, 1)), nullptr, &max_val_r, nullptr, &right_peak_loc);
+            right_peak_loc.x += r_min;
+        }
+        else
+        {
+            right_peak_loc.x = last_right_hist_x;
+        }
 
-    last_left_x = cur_left_x;
-    last_right_x = cur_right_x;
-    // --- FIN LÓGICA DE ROBUSTEZ ---
+        int cur_left_x = left_peak_loc.x;
+        int cur_right_x = right_peak_loc.x;
 
-    std::vector<cv::Point2f> left_pts;
-    std::vector<cv::Point2f> right_pts;
+        // --- LÓGICA DE ROBUSTEZ: Validación desde el Ego Center ---
+        const double intensity_threshold = p.min_pixels * 3.0;
+        bool left_valid_init = max_val_l > intensity_threshold;
+        bool right_valid_init = max_val_r > intensity_threshold;
 
-    for (int win = 0; win < p.n_windows; ++win) {
-        const int y_low = bev_h - (win + 1) * win_h;
+        const int ego_center = bev_w / 2;
+        const double expected_dist = lane_px / 2.0;
+        const double tolerance_init = expected_dist * 0.5;
 
-        auto extract_window = [&](int cx, std::vector<cv::Point2f>& pts,
-                      const cv::Scalar& color,
-                      bool exclude_near_left) {
-            const int x_low  = std::max(0, cx - p.win_half_w);
-            const int x_high = std::min(bev_w, cx + p.win_half_w);
+        // Validar picos iniciales contra el auto
+        if (left_valid_init)
+        {
+            double dist = ego_center - cur_left_x;
+            if (dist < 0 || dist > (expected_dist + tolerance_init))
+                left_valid_init = false;
+        }
+        if (right_valid_init)
+        {
+            double dist = cur_right_x - ego_center;
+            if (dist < 0 || dist > (expected_dist + tolerance_init))
+                right_valid_init = false;
+        }
 
-            cv::Rect roi(x_low, y_low, x_high - x_low, win_h);
-            cv::rectangle(viz, roi, color, 1);
+        // Inferencia geométrica inicial para la ventana deslizante
+        if (left_valid_init && !right_valid_init)
+            cur_right_x = cur_left_x + static_cast<int>(lane_px);
+        else if (!left_valid_init && right_valid_init)
+            cur_left_x = cur_right_x - static_cast<int>(lane_px);
 
-            cv::Mat window = bev_binary(roi);
-            std::vector<cv::Point> nz;
-            cv::findNonZero(window, nz);
+        // Guardar para el próximo histograma
+        const double alpha_hist = 0.1;
+        last_left_hist_x = static_cast<int>((alpha_hist * cur_left_x) + ((1.0 - alpha_hist) * last_left_hist_x));
+        last_right_hist_x = static_cast<int>((alpha_hist * cur_right_x) + ((1.0 - alpha_hist) * last_right_hist_x));
+        // --- FIN LÓGICA DE ROBUSTEZ ---
 
-            std::vector<cv::Point2f> accepted_pts;
-            std::vector<float> x_coords; 
-            accepted_pts.reserve(nz.size());
-            x_coords.reserve(nz.size());
-            
-            for (const auto& pt : nz) {
-                const int global_x = pt.x + x_low;
-                if (exclude_near_left && std::abs(global_x - cur_left_x) < min_separation_px) {
-                    continue;
+        std::vector<cv::Point2f> left_pts;
+        std::vector<cv::Point2f> right_pts;
+
+        for (int win = 0; win < p.n_windows; ++win)
+        {
+            const int y_low = bev_h - (win + 1) * win_h;
+
+            auto extract_window = [&](int &cx, std::vector<cv::Point2f> &pts,
+                                      const cv::Scalar &color,
+                                      bool exclude_near_left)
+            {
+                const int x_low = std::max(0, cx - p.win_half_w);
+                const int x_high = std::min(bev_w, cx + p.win_half_w);
+
+                cv::Rect roi(x_low, y_low, x_high - x_low, win_h);
+                cv::rectangle(viz, roi, color, 1);
+
+                cv::Mat window = bev_binary(roi);
+                std::vector<cv::Point> nz;
+                cv::findNonZero(window, nz);
+
+                std::vector<float> x_coords;
+                std::vector<cv::Point2f> temp_accepted_pts;
+
+                temp_accepted_pts.reserve(nz.size());
+                x_coords.reserve(nz.size());
+
+                for (const auto &pt : nz)
+                {
+                    const int global_x = pt.x + x_low;
+                    if (exclude_near_left && std::abs(global_x - cur_left_x) < min_separation_px)
+                        continue;
+                    temp_accepted_pts.emplace_back(static_cast<float>(global_x), static_cast<float>(pt.y + y_low));
+                    x_coords.push_back(static_cast<float>(global_x));
                 }
-                accepted_pts.emplace_back(static_cast<float>(global_x), static_cast<float>(pt.y + y_low));
-                x_coords.push_back(static_cast<float>(global_x));
-            }
 
-            const int window_energy = static_cast<int>(accepted_pts.size());
+                if (static_cast<int>(temp_accepted_pts.size()) >= p.min_pixels)
+                {
+                    // USO DE MEDIANA
+                    std::sort(x_coords.begin(), x_coords.end());
+                    int new_cx = static_cast<int>(x_coords[x_coords.size() / 2]);
 
-            if (window_energy >= p.min_pixels) {
-                // --- MEJORA 2: USO DE MEDIANA EN LUGAR DE PROMEDIO ---
-                std::sort(x_coords.begin(), x_coords.end());
-                int new_cx = static_cast<int>(x_coords[x_coords.size() / 2]);
+                    // Inercia lateral estricta
+                    const int max_shift_px = static_cast<int>(p.win_half_w * 0.3);
+                    int delta_x = new_cx - cx;
+                    if (std::abs(delta_x) > max_shift_px)
+                        cx += (delta_x > 0) ? max_shift_px : -max_shift_px;
+                    else
+                        cx = new_cx;
 
-                // Inercia
-                const int max_shift_px = static_cast<int>(p.win_half_w * 0.4); 
-                int delta_x = new_cx - cx;
-
-                if (std::abs(delta_x) > max_shift_px) {
-                    cx += (delta_x > 0) ? max_shift_px : -max_shift_px;
-                } else {
-                    cx = new_cx;
+                    // Filtrado de energía
+                    if (static_cast<int>(temp_accepted_pts.size()) >= static_cast<int>(p.min_pixels * 1.5))
+                    {
+                        pts.insert(pts.end(), temp_accepted_pts.begin(), temp_accepted_pts.end());
+                    }
                 }
+                return cx;
+            };
 
-                if (window_energy >= static_cast<int>(p.min_pixels * 1.2)) {
-                    pts.insert(pts.end(), accepted_pts.begin(), accepted_pts.end());
-                }
-            }
+            cur_left_x = extract_window(cur_left_x, left_pts, cv::Scalar(255, 100, 0), false);
+            cur_right_x = extract_window(cur_right_x, right_pts, cv::Scalar(0, 100, 255), true);
+        }
 
-            return cx;
+        LaneState state;
+        state.left = fit_polynomial(left_pts, bev_h);
+        state.right = fit_polynomial(right_pts, bev_h);
+
+        // ==========================================================================
+        // MHT MEJORADO CON SIMILITUD DE FORMA
+        // ==========================================================================
+
+        // ==========================================================================
+        // MHT CON SEMÁNTICA DESACOPLADA (5 HIPÓTESIS)
+        // ==========================================================================
+        static PolyCoeffs last_best_center;
+        static bool has_history = false;
+
+        struct Hypothesis
+        {
+            PolyCoeffs poly;
+            double error_pos;
+            double error_shape;
+            double total_error;
+            bool valid;
+            cv::Scalar color; // Para debug visual
         };
 
-        cur_left_x  = extract_window(cur_left_x, left_pts, cv::Scalar(255, 100, 0), false);
-        cur_right_x = extract_window(cur_right_x, right_pts, cv::Scalar(0, 100, 255), true);
-    }
+        Hypothesis h_both = {{0, 0, 0, false}, 1e9, 1e9, 1e9, false, cv::Scalar(255, 0, 255)};     // Fucsia
+        Hypothesis h_L_is_L = {{0, 0, 0, false}, 1e9, 1e9, 1e9, false, cv::Scalar(255, 255, 0)};   // Cian
+        Hypothesis h_L_is_R = {{0, 0, 0, false}, 1e9, 1e9, 1e9, false, cv::Scalar(255, 255, 255)}; // Blanco (Tu caso!)
+        Hypothesis h_R_is_R = {{0, 0, 0, false}, 1e9, 1e9, 1e9, false, cv::Scalar(0, 255, 255)};   // Amarillo
+        Hypothesis h_R_is_L = {{0, 0, 0, false}, 1e9, 1e9, 1e9, false, cv::Scalar(0, 0, 255)};     // Rojo
 
-    LaneState state;
-    state.left  = fit_polynomial(left_pts, bev_h);
-    state.right = fit_polynomial(right_pts, bev_h);
-
-    // --- Validación de ancho del carril ---
-    if (state.left.valid && state.right.valid) {
-        const double y_base = static_cast<double>(bev_h);
-        const double u_L = state.left.a  * y_base * y_base + state.left.b  * y_base + state.left.c;
-        const double u_R = state.right.a * y_base * y_base + state.right.b * y_base + state.right.c;
-        const double ancho_m = (u_R - u_L) * p.bev_scale_mpp;
-
-        if (ancho_m < 0.25 || ancho_m > 0.45) {
-            state.width_warning = true;
+        // 1. Ambas líneas son correctas (solo si la distancia entre ellas tiene sentido)
+        if (state.left.valid && state.right.valid)
+        {
+            double dist = std::abs(state.right.c - state.left.c);
+            if (dist > lane_px * 0.6 && dist < lane_px * 1.4)
+            {
+                h_both.poly.a = (state.left.a + state.right.a) / 2.0;
+                h_both.poly.b = (state.left.b + state.right.b) / 2.0;
+                h_both.poly.c = (state.left.c + state.right.c) / 2.0;
+                h_both.poly.valid = true;
+                h_both.valid = true;
+            }
         }
-    }
 
-    // --- Centro del carril ---
-    if (state.left.valid && state.right.valid) {
-        state.center.a = (state.left.a + state.right.a) / 2.0;
-        state.center.b = (state.left.b + state.right.b) / 2.0;
-        state.center.c = (state.left.c + state.right.c) / 2.0;
-        state.center.valid = true;
-    } else if (state.left.valid) {
-        state.center.a = state.left.a;
-        state.center.b = state.left.b;
-        state.center.c = state.left.c + lane_px / 2.0;
-        state.center.valid = true;
-    } else if (state.right.valid) {
-        state.center.a = state.right.a;
-        state.center.b = state.right.b;
-        state.center.c = state.right.c - lane_px / 2.0;
-        state.center.valid = true;
-    }
+        // 2 y 3. Hipótesis sobre la ventana "Izquierda" (Azul)
+        if (state.left.valid)
+        {
+            h_L_is_L.poly = state.left;
+            h_L_is_L.poly.c += (lane_px / 2.0); // Asumimos que es la Izquierda -> Centro a la derecha
+            h_L_is_L.poly.valid = true;
+            h_L_is_L.valid = true;
 
-    // --- Kalman sobre centro (a, b, c) ---
-    static cv::KalmanFilter kf;
-    static bool kf_configured = false;
-    static bool kf_initialized = false;
-
-    if (!kf_configured) {
-        kf.init(3, 3, 0, CV_32F);
-        kf.transitionMatrix = cv::Mat::eye(3, 3, CV_32F);
-        kf.measurementMatrix = cv::Mat::eye(3, 3, CV_32F);
-        kf.processNoiseCov = cv::Mat::eye(3, 3, CV_32F) * 1e-4f;
-        kf.measurementNoiseCov = cv::Mat::eye(3, 3, CV_32F) * 1e-2f;
-        kf.errorCovPost = cv::Mat::eye(3, 3, CV_32F);
-        kf_configured = true;
-    }
-
-    cv::Mat prediction;
-    if (kf_initialized) {
-        prediction = kf.predict();
-    }
-
-    if (state.center.valid) {
-        cv::Mat measurement(3, 1, CV_32F);
-        measurement.at<float>(0, 0) = static_cast<float>(state.center.a);
-        measurement.at<float>(1, 0) = static_cast<float>(state.center.b);
-        measurement.at<float>(2, 0) = static_cast<float>(state.center.c);
-
-        if (!kf_initialized) {
-            kf.statePost = measurement.clone();
-            kf.statePre = measurement.clone();
-            kf_initialized = true;
-        } else {
-            const cv::Mat estimated = kf.correct(measurement);
-            state.center.a = static_cast<double>(estimated.at<float>(0, 0));
-            state.center.b = static_cast<double>(estimated.at<float>(1, 0));
-            state.center.c = static_cast<double>(estimated.at<float>(2, 0));
-            state.center.valid = true;
+            h_L_is_R.poly = state.left;
+            h_L_is_R.poly.c -= (lane_px / 2.0); // Asumimos que es la Derecha -> Centro a la izquierda
+            h_L_is_R.poly.valid = true;
+            h_L_is_R.valid = true;
         }
-    } else if (kf_initialized) {
-        state.center.a = static_cast<double>(prediction.at<float>(0, 0));
-        state.center.b = static_cast<double>(prediction.at<float>(1, 0));
-        state.center.c = static_cast<double>(prediction.at<float>(2, 0));
-        state.center.valid = true;
+
+        // 4 y 5. Hipótesis sobre la ventana "Derecha" (Naranja)
+        if (state.right.valid)
+        {
+            h_R_is_R.poly = state.right;
+            h_R_is_R.poly.c -= (lane_px / 2.0); // Asumimos que es la Derecha -> Centro a la izquierda
+            h_R_is_R.poly.valid = true;
+            h_R_is_R.valid = true;
+
+            h_R_is_L.poly = state.right;
+            h_R_is_L.poly.c += (lane_px / 2.0); // Asumimos que es la Izquierda -> Centro a la derecha
+            h_R_is_L.poly.valid = true;
+            h_R_is_L.valid = true;
+        }
+
+        state.center.valid = false;
+
+        if (!has_history)
+        {
+            // Inicialización: Buscamos la que ponga el centro más cerca de la mitad del auto (bev_w/2)
+            double best_c_dist = 1e9;
+            std::vector<Hypothesis *> init_hyps = {&h_both, &h_L_is_L, &h_L_is_R, &h_R_is_R, &h_R_is_L};
+            for (auto h : init_hyps)
+            {
+                if (h->valid)
+                {
+                    double d = std::abs(h->poly.c - bev_w / 2.0);
+                    if (d < best_c_dist)
+                    {
+                        best_c_dist = d;
+                        state.center = h->poly;
+                    }
+                }
+            }
+            if (state.center.valid)
+            {
+                last_best_center = state.center;
+                has_history = true;
+            }
+        }
+        else
+        {
+            auto calc_pos_error = [&](const PolyCoeffs &cand) -> double
+            {
+                if (!cand.valid)
+                    return 1e9;
+                double err = 0;
+                std::vector<std::pair<double, double>> y_evals = {{static_cast<double>(bev_h), 1.0}, {bev_h * 0.6, 0.5}};
+                for (auto &y_w : y_evals)
+                {
+                    double y = y_w.first;
+                    double weight = y_w.second;
+                    double x_cand = cand.a * y * y + cand.b * y + cand.c;
+                    double x_hist = last_best_center.a * y * y + last_best_center.b * y + last_best_center.c;
+                    err += std::abs(x_cand - x_hist) * weight;
+                }
+                return err / 1.5;
+            };
+
+            auto calc_shape_error = [&](const PolyCoeffs &cand) -> double
+            {
+                if (!cand.valid)
+                    return 1e9;
+                double diff_a = std::abs(cand.a - last_best_center.a) * 1e6;
+                double diff_b = std::abs(cand.b - last_best_center.b) * 10.0;
+                return diff_a + diff_b;
+            };
+
+            std::vector<Hypothesis *> hyps = {&h_both, &h_L_is_L, &h_L_is_R, &h_R_is_R, &h_R_is_L};
+
+            // Bonus artificial para 'h_both' si es válida (preferimos usar ambas líneas si tiene sentido)
+            if (h_both.valid)
+                h_both.total_error -= 10.0;
+
+            for (auto h : hyps)
+            {
+                if (h->valid)
+                {
+                    h->error_pos = calc_pos_error(h->poly);
+                    h->error_shape = calc_shape_error(h->poly);
+                    // Calculamos el error total (penalizando fuerte si la curva es distinta)
+                    h->total_error = h->error_pos + (h->error_shape * 25.0);
+                }
+            }
+
+            Hypothesis *best_h = nullptr;
+            double min_err = 1e9;
+            for (auto h : hyps)
+            {
+                if (h->valid && h->total_error < min_err)
+                {
+                    min_err = h->total_error;
+                    best_h = h;
+                }
+            }
+
+            const double max_pos_jump = lane_px * 0.8;
+
+            if (best_h && best_h->error_pos < max_pos_jump)
+            {
+                state.center = best_h->poly;
+
+                // Suavizado temporal
+                const double alpha_smooth = 0.15;
+                last_best_center.a = (alpha_smooth * state.center.a) + ((1.0 - alpha_smooth) * last_best_center.a);
+                last_best_center.b = (alpha_smooth * state.center.b) + ((1.0 - alpha_smooth) * last_best_center.b);
+                last_best_center.c = (alpha_smooth * state.center.c) + ((1.0 - alpha_smooth) * last_best_center.c);
+            }
+            else
+            {
+                state.center = last_best_center;
+            }
+        }
+
+        // ==========================================================================
+        // VISUALIZACIÓN DE DEPURACIÓN
+        // ==========================================================================
+        draw_polynomial(viz, state.left, bev_h, cv::Scalar(255, 200, 0), 2);  // Azul tracker
+        draw_polynomial(viz, state.right, bev_h, cv::Scalar(0, 100, 255), 2); // Naranja tracker
+
+        // Dibujar las 5 hipótesis
+        std::vector<Hypothesis *> all_hyps = {&h_both, &h_L_is_L, &h_L_is_R, &h_R_is_R, &h_R_is_L};
+        for (auto h : all_hyps)
+        {
+            if (h->valid)
+                draw_polynomial(viz, h->poly, bev_h, h->color, 1);
+        }
+
+        // Dibujar el centro ganador (Verde grueso)
+        draw_polynomial(viz, state.center, bev_h, cv::Scalar(0, 255, 0), 3);
+
+        return state;
     }
 
-    // --- Visualización ---
-    draw_polynomial(viz, state.left,   bev_h, cv::Scalar(255, 200, 0));
-    draw_polynomial(viz, state.right,  bev_h, cv::Scalar(0, 200, 255));
-    draw_polynomial(viz, state.center, bev_h, cv::Scalar(0, 255, 0));
+    // --------------------------------------------------------------------------
+    // fit_polynomial — ajuste por mínimos cuadrados (SVD)
+    // --------------------------------------------------------------------------
 
-    return state;
-}
+    static PolyCoeffs fit_polynomial(const std::vector<cv::Point2f> &pts, int img_height)
+    {
+        PolyCoeffs coeffs;
+        if (static_cast<int>(pts.size()) < 15)
+        {
+            return coeffs;
+        }
 
-// --------------------------------------------------------------------------
-// fit_polynomial — ajuste por mínimos cuadrados (SVD)
-// --------------------------------------------------------------------------
+        const int n = static_cast<int>(pts.size());
+        cv::Mat A(n, 3, CV_64F);
+        cv::Mat B(n, 1, CV_64F);
 
-static PolyCoeffs fit_polynomial(const std::vector<cv::Point2f>& pts, int img_height) {
-    PolyCoeffs coeffs;
-    if (static_cast<int>(pts.size()) < 20) {
+        const double y_scale = static_cast<double>(img_height);
+        for (int i = 0; i < n; ++i)
+        {
+            const double y = pts[i].y / y_scale;
+            A.at<double>(i, 0) = y * y;
+            A.at<double>(i, 1) = y;
+            A.at<double>(i, 2) = 1.0;
+            B.at<double>(i, 0) = pts[i].x;
+        }
+
+        cv::Mat result;
+        const bool ok = cv::solve(A, B, result, cv::DECOMP_SVD);
+        if (!ok)
+        {
+            return coeffs;
+        }
+
+        coeffs.a = result.at<double>(0, 0) / (y_scale * y_scale);
+        coeffs.b = result.at<double>(1, 0) / y_scale;
+        coeffs.c = result.at<double>(2, 0);
+        coeffs.valid = true;
+
         return coeffs;
     }
 
-    const int n = static_cast<int>(pts.size());
-    cv::Mat A(n, 3, CV_64F);
-    cv::Mat B(n, 1, CV_64F);
+    // --------------------------------------------------------------------------
+    // draw_polynomial — dibuja el polinomio sobre la visualización
+    // --------------------------------------------------------------------------
 
-    const double y_scale = static_cast<double>(img_height);
-    for (int i = 0; i < n; ++i) {
-        const double y = pts[i].y / y_scale;
-        A.at<double>(i, 0) = y * y;
-        A.at<double>(i, 1) = y;
-        A.at<double>(i, 2) = 1.0;
-        B.at<double>(i, 0) = pts[i].x;
-    }
+    static void draw_polynomial(cv::Mat &viz, const PolyCoeffs &c,
+                                int height, cv::Scalar color, int thickness)
+    {
+        if (!c.valid)
+            return;
 
-    cv::Mat result;
-    const bool ok = cv::solve(A, B, result, cv::DECOMP_SVD);
-    if (!ok) {
-        return coeffs;
-    }
-
-    coeffs.a = result.at<double>(0, 0) / (y_scale * y_scale);
-    coeffs.b = result.at<double>(1, 0) / y_scale;
-    coeffs.c = result.at<double>(2, 0);
-    coeffs.valid = true;
-
-    return coeffs;
-}
-
-// --------------------------------------------------------------------------
-// draw_polynomial — dibuja el polinomio sobre la visualización
-// --------------------------------------------------------------------------
-
-static void draw_polynomial(cv::Mat& viz, const PolyCoeffs& c,
-                            int height, cv::Scalar color) {
-    if (!c.valid) {
-        return;
-    }
-
-    std::vector<cv::Point> pts;
-    for (int y = 0; y < height; y += 2) {
-        const int x = static_cast<int>(c.a * y * y + c.b * y + c.c);
-        if (x >= 0 && x < viz.cols) {
-            pts.emplace_back(x, y);
+        std::vector<cv::Point> pts;
+        for (int y = 0; y < height; y += 4)
+        {
+            const int x = static_cast<int>(c.a * y * y + c.b * y + c.c);
+            if (x >= 0 && x < viz.cols)
+                pts.emplace_back(x, y);
         }
+
+        if (pts.size() > 1)
+            cv::polylines(viz, pts, false, color, thickness);
     }
 
-    if (pts.size() > 1) {
-        cv::polylines(viz, pts, false, color, 2);
-    }
-}
-
-}  // namespace lane_detection
+} // namespace lane_detection

@@ -147,6 +147,17 @@ LanePipelineNode::LanePipelineNode()
     declare_parameter("camera_cx", 315.689);
     declare_parameter("camera_cy", 178.333);
 
+    // --- Preprocesamiento HLS ---
+    declare_parameter("hls.white_l_min", 160);
+    declare_parameter("hls.white_l_max", 255);
+    declare_parameter("hls.white_s_max", 140);
+    declare_parameter("hls.yellow_h_min", 15);
+    declare_parameter("hls.yellow_h_max", 35);
+    declare_parameter("hls.yellow_l_min", 80);
+    declare_parameter("hls.yellow_l_max", 220);
+    declare_parameter("hls.yellow_s_min", 100);
+    declare_parameter("hls.yellow_s_max", 255);
+
     // --- Leer parámetros ---
     frames_dir_    = get_parameter("frames_dir").as_string();
     bev_scale_mpp_ = get_parameter("bev_scale_mpp").as_double();
@@ -215,6 +226,19 @@ LanePipelineNode::LanePipelineNode()
                         "Parámetro BEV '%s' modificado, se recalculará.", name.c_str());
                     break;
                 }
+
+                if (name.rfind("hls.", 0) == 0) {
+                    hls_params_ = build_hls_params();
+                    RCLCPP_INFO(get_logger(),
+                        "Parámetro HLS '%s' modificado. Nuevos umbrales: "
+                        "W[L:%d-%d,S<=%d] Y[H:%d-%d,L:%d-%d,S:%d-%d]",
+                        name.c_str(),
+                        hls_params_.white_l_min, hls_params_.white_l_max, hls_params_.white_s_max,
+                        hls_params_.yellow_h_min, hls_params_.yellow_h_max,
+                        hls_params_.yellow_l_min, hls_params_.yellow_l_max,
+                        hls_params_.yellow_s_min, hls_params_.yellow_s_max);
+                    break;
+                }
             }
             rcl_interfaces::msg::SetParametersResult result;
             result.successful = true;
@@ -257,8 +281,17 @@ BevConfig LanePipelineNode::build_bev_config() const {
 }
 
 lane_detection::HlsParams LanePipelineNode::build_hls_params() const {
-    // Valores por defecto; en el futuro se pueden exponer como parámetros ROS2
-    return lane_detection::HlsParams{};
+    lane_detection::HlsParams p;
+    p.white_l_min  = get_parameter("hls.white_l_min").as_int();
+    p.white_l_max  = get_parameter("hls.white_l_max").as_int();
+    p.white_s_max  = get_parameter("hls.white_s_max").as_int();
+    p.yellow_h_min = get_parameter("hls.yellow_h_min").as_int();
+    p.yellow_h_max = get_parameter("hls.yellow_h_max").as_int();
+    p.yellow_l_min = get_parameter("hls.yellow_l_min").as_int();
+    p.yellow_l_max = get_parameter("hls.yellow_l_max").as_int();
+    p.yellow_s_min = get_parameter("hls.yellow_s_min").as_int();
+    p.yellow_s_max = get_parameter("hls.yellow_s_max").as_int();
+    return p;
 }
 
 lane_detection::SlidingWindowParams LanePipelineNode::build_sw_params() const {

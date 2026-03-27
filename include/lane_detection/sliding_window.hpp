@@ -16,7 +16,7 @@ namespace lane_detection {
 
 struct SlidingWindowParams {
     int n_windows    = 9;
-    int win_half_w   = 30;       // px
+    int win_half_w   = 60;       // px
     int min_pixels   = 40;
     double lane_width_m  = 0.35;
     double bev_scale_mpp = 0.005;

@@ -3,7 +3,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
-FRAMES_DIR="$SCRIPT_DIR/frames"
+FRAMES_DIR="$SCRIPT_DIR/frames/test_1"
 RATE_HZ="25.0"
 PYTHON_BIN="/usr/bin/python3"
 AUTO_BUILD="1"
