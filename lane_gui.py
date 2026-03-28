@@ -500,7 +500,7 @@ class BevCalibrationPanel(QFrame):
     ]
 
     DEFAULT_TUNE = {
-        "center_inference_extra_px": 2.0,
+        "center_inference_extra_px": 15.0,
     }
 
     POINT_NAMES = [

@@ -118,7 +118,7 @@ LanePipelineNode::LanePipelineNode()
     declare_parameter("bev_scale_mpp", 0.005);
     declare_parameter("alpha_filter", 0.3);
     declare_parameter("lane_width_m", 0.35);
-    declare_parameter("center_inference_extra_px", 2.0);
+    declare_parameter("center_inference_extra_px", 15.0);
     declare_parameter("camera_offset_m", 0.23);
     declare_parameter("start_paused", false);
 

@@ -20,7 +20,7 @@ struct SlidingWindowParams {
     int min_pixels   = 40;
     double lane_width_m  = 0.35;
     double bev_scale_mpp = 0.005;
-    double center_inference_extra_px = 2.0;  // separa el centro inferido unos px extra
+    double center_inference_extra_px = 15.0;  // separa el centro inferido unos px extra
 };
 
 /// Ejecuta sliding window sobre BEV binarizado.
