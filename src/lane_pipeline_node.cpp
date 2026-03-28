@@ -118,6 +118,7 @@ LanePipelineNode::LanePipelineNode()
     declare_parameter("bev_scale_mpp", 0.005);
     declare_parameter("alpha_filter", 0.3);
     declare_parameter("lane_width_m", 0.35);
+    declare_parameter("center_inference_extra_px", 2.0);
     declare_parameter("camera_offset_m", 0.23);
     declare_parameter("start_paused", false);
 
@@ -239,6 +240,14 @@ LanePipelineNode::LanePipelineNode()
                         hls_params_.yellow_s_min, hls_params_.yellow_s_max);
                     break;
                 }
+
+                if (name == "center_inference_extra_px") {
+                    sw_params_ = build_sw_params();
+                    RCLCPP_INFO(get_logger(),
+                        "Parámetro SlidingWindow '%s' modificado. offset_extra=%.2f px",
+                        name.c_str(), sw_params_.center_inference_extra_px);
+                    break;
+                }
             }
             rcl_interfaces::msg::SetParametersResult result;
             result.successful = true;
@@ -298,6 +307,7 @@ lane_detection::SlidingWindowParams LanePipelineNode::build_sw_params() const {
     lane_detection::SlidingWindowParams p;
     p.lane_width_m  = lane_width_m_;
     p.bev_scale_mpp = bev_scale_mpp_;
+    p.center_inference_extra_px = get_parameter("center_inference_extra_px").as_double();
     return p;
 }
 

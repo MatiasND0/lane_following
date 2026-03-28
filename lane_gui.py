@@ -61,6 +61,7 @@ class RosSignals(QObject):
     control_command = pyqtSignal(str)
     set_bev_params  = pyqtSignal(list, list)  # (src_pts_flat, dst_pts_flat)
     set_camera_params = pyqtSignal(dict)      # parámetros de orientación de cámara
+    set_tuning_params = pyqtSignal(dict)      # parámetros de tuning del detector
 
 
 # ---------------------------------------------------------------------------
@@ -107,6 +108,7 @@ class LaneGuiNode(Node):
         )
         self.signals.set_bev_params.connect(self._on_set_bev_params)
         self.signals.set_camera_params.connect(self._on_set_camera_params)
+        self.signals.set_tuning_params.connect(self._on_set_tuning_params)
 
         self.get_logger().info("LaneGuiNode suscrito a los topics de debug.")
 
@@ -191,15 +193,40 @@ class LaneGuiNode(Node):
         future = self.set_params_client.call_async(request)
         future.add_done_callback(self._on_set_params_done)
 
+    def _on_set_tuning_params(self, params: dict):
+        """Envía parámetros de tuning del detector al nodo C++ via SetParameters."""
+        if not self.set_params_client.wait_for_service(timeout_sec=1.0):
+            self.get_logger().warn("Servicio SetParameters del nodo pipeline no disponible.")
+            return
+
+        request = SetParameters.Request()
+
+        param_map = {
+            "center_inference_extra_px": ParameterType.PARAMETER_DOUBLE,
+        }
+
+        for name, ptype in param_map.items():
+            if name not in params:
+                continue
+            p = RosParameter()
+            p.name = name
+            p.value = ParameterValue()
+            p.value.type = ptype
+            p.value.double_value = float(params[name])
+            request.parameters.append(p)
+
+        future = self.set_params_client.call_async(request)
+        future.add_done_callback(self._on_set_params_done)
+
     def _on_set_params_done(self, future):
         try:
             response = future.result()
             ok = all(r.successful for r in response.results)
             if ok:
-                self.get_logger().info("Parámetros BEV actualizados exitosamente.")
+                self.get_logger().info("Parámetros actualizados exitosamente.")
             else:
                 reasons = [r.reason for r in response.results if not r.successful]
-                self.get_logger().warn(f"Fallo al actualizar BEV: {reasons}")
+                self.get_logger().warn(f"Fallo al actualizar parámetros: {reasons}")
         except Exception as e:
             self.get_logger().error(f"Error al llamar SetParameters: {e}")
 
@@ -454,8 +481,7 @@ class MetricsPanel(QFrame):
 class BevCalibrationPanel(QFrame):
     """
     Panel interactivo para calibrar los puntos de la homografía BEV.
-    Contiene spinboxes para los 4 puntos src y 4 puntos dst,
-    organizados en dos tabs.
+    Contiene tabs para puntos SRC/DST, cámara y tuning del detector.
     """
 
     # Defaults (mismos que el nodo C++)
@@ -472,6 +498,10 @@ class BevCalibrationPanel(QFrame):
         (288.0, 240.0),   # bottom-right (320*0.90, 240)
         (32.0,  240.0),   # bottom-left  (320*0.10, 240)
     ]
+
+    DEFAULT_TUNE = {
+        "center_inference_extra_px": 2.0,
+    }
 
     POINT_NAMES = [
         "Sup-Izq (lejos)",
@@ -503,10 +533,12 @@ class BevCalibrationPanel(QFrame):
         self.src_spins = self._build_point_tab("Trapecio (Perspectiva)", 640, 360)
         self.dst_spins = self._build_point_tab("Rectángulo (BEV)", 320, 240)
         self.camera_tab = self._build_camera_tab()
+        self.tune_tab = self._build_tuning_tab()
 
         tabs.addTab(self.src_spins["widget"], "SRC")
         tabs.addTab(self.dst_spins["widget"], "DST")
         tabs.addTab(self.camera_tab["widget"], "CAM")
+        tabs.addTab(self.tune_tab["widget"], "TUNE")
         layout.addWidget(tabs, stretch=1)
 
         # Botones
@@ -521,12 +553,17 @@ class BevCalibrationPanel(QFrame):
         self.apply_cam_btn.setObjectName("calibApplyBtn")
         self.apply_cam_btn.clicked.connect(self._on_apply_camera)
 
+        self.apply_tune_btn = QPushButton("🎯 Aplicar Tuning")
+        self.apply_tune_btn.setObjectName("calibApplyBtn")
+        self.apply_tune_btn.clicked.connect(self._on_apply_tuning)
+
         self.reset_btn = QPushButton("↻ Reset")
         self.reset_btn.setObjectName("calibResetBtn")
         self.reset_btn.clicked.connect(self._on_reset)
 
         btn_layout.addWidget(self.apply_btn)
         btn_layout.addWidget(self.apply_cam_btn)
+        btn_layout.addWidget(self.apply_tune_btn)
         btn_layout.addWidget(self.reset_btn)
         layout.addLayout(btn_layout)
 
@@ -676,6 +713,43 @@ class BevCalibrationPanel(QFrame):
         layout.addStretch()
         return {"widget": widget, "spins": spins}
 
+    def _build_tuning_tab(self) -> dict:
+        """Construye el tab con parámetros de tuning del detector."""
+        widget = QWidget()
+        widget.setObjectName("calibTabContent")
+        layout = QVBoxLayout(widget)
+        layout.setContentsMargins(4, 4, 4, 4)
+        layout.setSpacing(4)
+
+        spins = {}
+
+        group = QFrame()
+        group.setObjectName("calibPointGroup")
+        glayout = QHBoxLayout(group)
+        glayout.setContentsMargins(4, 2, 4, 2)
+        glayout.setSpacing(4)
+
+        lbl = QLabel("Ctr +px")
+        lbl.setObjectName("calibPointLabel")
+        lbl.setFixedWidth(56)
+        lbl.setToolTip("Separación extra (px) del centro inferido respecto al medio carril")
+
+        spin = QDoubleSpinBox()
+        spin.setObjectName("calibSpin")
+        spin.setRange(-20.0, 20.0)
+        spin.setSingleStep(0.1)
+        spin.setDecimals(2)
+        spin.setSuffix(" px")
+        spin.setValue(self.DEFAULT_TUNE["center_inference_extra_px"])
+
+        glayout.addWidget(lbl)
+        glayout.addWidget(spin, 1)
+        layout.addWidget(group)
+
+        spins["center_inference_extra_px"] = spin
+        layout.addStretch()
+        return {"widget": widget, "spins": spins}
+
     def _on_apply(self):
         src_flat = self._get_values(self.src_spins)
         dst_flat = self._get_values(self.dst_spins)
@@ -698,6 +772,16 @@ class BevCalibrationPanel(QFrame):
         self.status_lbl.setText(f"📷 Cámara ({s['mode'].currentText()})")
         self.status_lbl.setStyleSheet("color: #69FF47;")
 
+    def _on_apply_tuning(self):
+        """Lee los valores del tab TUNE y los envía al nodo C++."""
+        s = self.tune_tab["spins"]
+        params = {
+            "center_inference_extra_px": s["center_inference_extra_px"].value(),
+        }
+        self.signals.set_tuning_params.emit(params)
+        self.status_lbl.setText(f"🎯 Tuning (extra={params['center_inference_extra_px']:.2f}px)")
+        self.status_lbl.setStyleSheet("color: #69FF47;")
+
     def _on_reset(self):
         self._set_values(self.src_spins, self.DEFAULT_SRC)
         self._set_values(self.dst_spins, self.DEFAULT_DST)
@@ -709,6 +793,9 @@ class BevCalibrationPanel(QFrame):
         s["roll"].setValue(0.0)
         s["altura"].setValue(0.230)
         s["offset"].setValue(32.5)
+        self.tune_tab["spins"]["center_inference_extra_px"].setValue(
+            self.DEFAULT_TUNE["center_inference_extra_px"]
+        )
         self.status_lbl.setText("↻ Valores por defecto")
         self.status_lbl.setStyleSheet("color: #FFA726;")
 

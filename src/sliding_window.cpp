@@ -221,26 +221,30 @@ namespace lane_detection
 
         if (state.left.valid)
         {
+            const double center_shift_px = (lane_px / 2.0) + p.center_inference_extra_px;
+
             h_L_is_L.poly = state.left;
-            h_L_is_L.poly.c += (lane_px / 2.0);
+            h_L_is_L.poly.c += center_shift_px;
             h_L_is_L.poly.valid = true;
             h_L_is_L.valid = true;
 
             h_L_is_R.poly = state.left;
-            h_L_is_R.poly.c -= (lane_px / 2.0);
+            h_L_is_R.poly.c -= center_shift_px;
             h_L_is_R.poly.valid = true;
             h_L_is_R.valid = true;
         }
 
         if (state.right.valid)
         {
+            const double center_shift_px = (lane_px / 2.0) + p.center_inference_extra_px;
+
             h_R_is_R.poly = state.right;
-            h_R_is_R.poly.c -= (lane_px / 2.0);
+            h_R_is_R.poly.c -= center_shift_px;
             h_R_is_R.poly.valid = true;
             h_R_is_R.valid = true;
 
             h_R_is_L.poly = state.right;
-            h_R_is_L.poly.c += (lane_px / 2.0);
+            h_R_is_L.poly.c += center_shift_px;
             h_R_is_L.poly.valid = true;
             h_R_is_L.valid = true;
         }
