@@ -351,17 +351,18 @@ namespace lane_detection
 
             if (best_h && best_h->error_pos < max_pos_jump)
             {
-                state.center = best_h->poly;
+                const double jump_px = std::abs(best_h->poly.c - last_best_center.c);
+                const double jump_ref_px = lane_px * 0.15;
+                const double scale = std::clamp(jump_ref_px / std::max(jump_px, 1e-6), 0.35, 1.0);
+                const double alpha_smooth = std::clamp(0.30 * scale, 0.12, 0.40);
+                last_best_center.a = (alpha_smooth * best_h->poly.a) + ((1.0 - alpha_smooth) * last_best_center.a);
+                last_best_center.b = (alpha_smooth * best_h->poly.b) + ((1.0 - alpha_smooth) * last_best_center.b);
+                last_best_center.c = (alpha_smooth * best_h->poly.c) + ((1.0 - alpha_smooth) * last_best_center.c);
+            }
 
-                const double alpha_smooth = 0.15;
-                last_best_center.a = (alpha_smooth * state.center.a) + ((1.0 - alpha_smooth) * last_best_center.a);
-                last_best_center.b = (alpha_smooth * state.center.b) + ((1.0 - alpha_smooth) * last_best_center.b);
-                last_best_center.c = (alpha_smooth * state.center.c) + ((1.0 - alpha_smooth) * last_best_center.c);
-            }
-            else
-            {
-                state.center = last_best_center;
-            }
+            // Publicar siempre el centro suavizado para evitar saltos discretos
+            // cuando MHT cambia de hipótesis frame a frame.
+            state.center = last_best_center;
         }
 
         // ==========================================================================
